@@ -5,6 +5,9 @@ import torch.nn.functional as F
 from transformers import GPT2Config
 from typing import Optional
 from collections import Counter
+from torch.distributions.normal import Normal
+
+softplus = nn.Softplus()
 
 # ===== Expert =====
 class Expert(nn.Module):
@@ -19,6 +22,184 @@ class Expert(nn.Module):
     def _reset_parameters(self, initializer_range):
         nn.init.normal_(self.w1.weight, mean=0.0, std=initializer_range)
         nn.init.normal_(self.w2.weight, mean=0.0, std=initializer_range)
+
+# ==== HyperMoE helpers ====
+def hyperfanin_init_weight(linear_layer, hypernet_in, mainnet_in):
+    bound = 1e-3 * math.sqrt(3 / (hypernet_in * mainnet_in))
+    nn.init.uniform_(linear_layer.weight, -bound, bound)
+    if linear_layer.bias is not None:
+        nn.init.constant_(linear_layer.bias, 0.0)
+
+def hyperfanin_init_bias(linear_layer, hypernet_in):
+    bound = 1e-3 * math.sqrt(3.0 / hypernet_in)
+    if linear_layer.bias is not None:
+        nn.init.uniform_(linear_layer.bias, -bound, bound)
+
+class SimpleGenerator(nn.Module):
+    def __init__(self, cfg, input_dim, output_dim):
+        super().__init__()
+        self.hidden_dim = cfg["hypernetwork_bottleneck"]
+        self.adapter_dim = cfg["adapter_dim"]
+        self.linear1 = nn.Linear(cfg["hypernet_input"] + cfg["layer_emb_dim"], self.hidden_dim)
+        self.activation_fn = nn.ReLU()
+        self.weight_up = nn.Linear(self.hidden_dim, output_dim * self.adapter_dim)
+        self.weight_down = nn.Linear(self.hidden_dim, input_dim * self.adapter_dim)
+        self.bias_up = nn.Linear(self.hidden_dim, output_dim)
+        self.bias_down = nn.Linear(self.hidden_dim, self.adapter_dim)
+        hyperfanin_init_weight(self.weight_up, self.hidden_dim, self.adapter_dim)
+        hyperfanin_init_weight(self.weight_down, self.hidden_dim, input_dim)
+        hyperfanin_init_bias(self.bias_up, self.hidden_dim)
+        hyperfanin_init_bias(self.bias_down, self.hidden_dim)
+
+    def forward(self, x):
+        x = self.activation_fn(self.linear1(x))
+        return (self.weight_up(x), self.weight_down(x), self.bias_up(x), self.bias_down(x))
+
+class ParameterGenerator(nn.Module):
+    def __init__(self, cfg, input_size, output_size):
+        super().__init__()
+        self.cfg = cfg
+        self.layer_embed = nn.Embedding(cfg["num_hidden_layers"], cfg["layer_emb_dim"])
+        self.decoder = SimpleGenerator(cfg, input_size, output_size)
+
+    def forward(self, hidden_inputs, layer_idx):
+        # hidden_inputs: [B, L, hypernet_input]
+        layer_idx = torch.ones(hidden_inputs.size(0), hidden_inputs.size(1),
+                               dtype=torch.long, device=hidden_inputs.device) * layer_idx
+        layer_inputs = self.layer_embed(layer_idx)
+        hidden_inputs = torch.cat([hidden_inputs, layer_inputs], dim=-1)
+        return self.decoder(hidden_inputs)
+
+class AdapterLayer(nn.Module):
+    def __init__(self, input_size, output_size, adapter_dim):
+        super().__init__()
+        self.adapter_dim = adapter_dim
+        self.input_dim = input_size
+        self.output_dim = output_size
+        # generated path (set at runtime)
+        self.adapter_down_weight = None
+        self.adapter_down_bias = None
+        self.adapter_up_weight = None
+        self.adapter_up_bias = None
+        # fallback manual adapters (used when clear)
+        self.hidden_act = nn.ReLU()
+        self.adapter_down_manual = nn.Linear(self.input_dim, self.adapter_dim)
+        self.adapter_up_manual = nn.Linear(self.adapter_dim, self.output_dim)
+        nn.init.xavier_uniform_(self.adapter_up_manual.weight, gain=1e-4)
+        nn.init.xavier_uniform_(self.adapter_down_manual.weight, gain=1e-4)
+        nn.init.constant_(self.adapter_up_manual.bias, 0.0)
+        nn.init.constant_(self.adapter_down_manual.bias, 0.0)
+
+    def clear_adapter(self):
+        self.adapter_down_weight = None
+        self.adapter_down_bias = None
+        self.adapter_up_weight = None
+        self.adapter_up_bias = None
+
+    def apply_adapter_params(self, bsz, lg, uw, dw, ub, db):
+        self.adapter_down_weight = dw.view(bsz, lg, self.input_dim, self.adapter_dim)
+        self.adapter_down_bias = db.view(bsz, lg, self.adapter_dim)
+        self.adapter_up_weight = uw.view(bsz, lg, self.adapter_dim, self.output_dim)
+        self.adapter_up_bias = ub.view(bsz, lg, self.output_dim)
+
+    def forward(self, x):
+        if self.adapter_down_weight is not None:
+            # ✅ 가중치 dtype으로 x를 맞춰 안전하게 연산
+            wd = self.adapter_down_weight
+            bu = self.adapter_up_bias
+            wu = self.adapter_up_weight
+            bd = self.adapter_down_bias
+            x = x.to(wd.dtype)
+            x = torch.einsum('bij,bijk->bik', x, wd) + bd
+            x = self.hidden_act(x)
+            x = torch.einsum('bik,bikj->bij', x, wu) + bu
+        else:
+            x = self.adapter_down_manual(x)
+            x = self.hidden_act(x)
+            x = self.adapter_up_manual(x)
+        return x
+
+class SparseDispatcher:
+    def __init__(self, n_experts, gates):
+        self._gates = gates
+        self._n_experts = n_experts
+        sorted_experts, index_sorted_experts = torch.nonzero(gates, as_tuple=False).sort(0)
+        _, self._expert_index = sorted_experts.split(1, dim=1)
+        self._batch_index = torch.nonzero(gates, as_tuple=False)[index_sorted_experts[:, 1], 0]
+        self._part_sizes = (gates > 0).sum(0).tolist()
+        gates_exp = gates[self._batch_index.flatten()]
+        self._nonzero_gates = torch.gather(gates_exp, 1, self._expert_index)
+
+    def dispatch(self, inp):
+        inp_exp = inp[self._batch_index].squeeze(1)
+        return torch.split(inp_exp, self._part_sizes, dim=0)
+
+    def combine(self, expert_out, multiply_by_gates=True):
+        stitched = torch.cat(expert_out, 0)
+        if multiply_by_gates:
+            _nonzero_gates = self._nonzero_gates.unsqueeze(-1) if stitched.dim()==2 else self._nonzero_gates
+            stitched = stitched.mul(_nonzero_gates)
+        if stitched.dim()==2:
+            zeros = torch.zeros(self._gates.size(0), stitched.size(1), device=stitched.device, dtype=stitched.dtype)
+        else:
+            zeros = torch.zeros(self._gates.size(0), stitched.size(-2), stitched.size(-1), device=stitched.device, dtype=stitched.dtype)
+        return zeros.index_add(0, self._batch_index, stitched)
+
+    def expert_to_gates(self):
+        return torch.split(self._nonzero_gates, self._part_sizes, dim=0)
+
+def _gates_to_load(gates): return (gates > 0).sum(0)
+
+def cv_squared(x):
+    eps = 1e-10
+    if x.shape[0] == 1: return torch.tensor([0.], device=x.device, dtype=x.dtype)
+    return x.float().var() / (x.float().mean()**2 + eps)
+
+def _prob_in_top_k(layer, clean_values, noisy_values, noise_stddev, noisy_top_values):
+    batch = clean_values.size(0)
+    m = noisy_top_values.size(1)
+    top_values_flat = noisy_top_values.flatten()
+    normal = Normal(layer.mean, layer.std)
+    threshold_positions_if_in = torch.arange(batch, device=clean_values.device) * m + layer.k
+    threshold_if_in = torch.unsqueeze(torch.gather(top_values_flat, 0, threshold_positions_if_in), 1)
+    is_in = torch.gt(noisy_values, threshold_if_in)
+    threshold_positions_if_out = threshold_positions_if_in - 1
+    threshold_if_out = torch.unsqueeze(torch.gather(top_values_flat, 0, threshold_positions_if_out), 1)
+    prob_if_in = normal.cdf((clean_values - threshold_if_in) / noise_stddev)
+    prob_if_out = normal.cdf((clean_values - threshold_if_out) / noise_stddev)
+    return torch.where(is_in, prob_if_in, prob_if_out)
+
+def noisy_top_k_gating_mixing(layer, x, train, noise_epsilon=1e-2):
+    clean_logits = x @ layer.w_gate  # [N, E]
+    if layer.noisy_gating and train:
+        raw_noise_stddev = x @ layer.w_noise
+        noise_stddev = softplus(raw_noise_stddev) + noise_epsilon
+        noisy_logits = clean_logits + (torch.randn_like(clean_logits) * noise_stddev)
+        logits = noisy_logits
+    else:
+        logits = clean_logits
+    logits = torch.softmax(logits, dim=-1)                 # (1) softmax
+    top_logits, top_indices = logits.topk(min(layer.k+1, layer.n_experts), dim=-1)
+    top_k_logits = top_logits[:, :layer.k]
+    top_k_indices = top_indices[:, :layer.k]
+    top_k_gates = top_k_logits / (top_k_logits.sum(dim=-1, keepdim=True) + 1e-9)
+
+    zeros = torch.zeros_like(logits, dtype=top_k_gates.dtype, device=x.device)
+    gates = zeros.scatter(1, top_k_indices, top_k_gates)
+
+    ones = torch.ones_like(top_k_logits, dtype=top_k_gates.dtype, device=x.device)
+    zeros_mask = torch.zeros_like(logits, dtype=top_k_gates.dtype, device=x.device)
+    unselected_mask = torch.ones_like(logits, dtype=top_k_gates.dtype, device=x.device) - \
+                      zeros_mask.scatter(1, top_k_indices, ones)
+    gates_unselected = unselected_mask / (unselected_mask.sum(dim=-1, keepdim=True) + 1e-9)
+
+    expert_mask = torch.nn.functional.one_hot(top_k_indices, num_classes=layer.n_experts).permute(2, 1, 0)
+
+    if layer.noisy_gating and layer.k < layer.n_experts and train:
+        load = (_prob_in_top_k(layer, clean_logits, noisy_logits, noise_stddev, top_logits)).sum(0)
+    else:
+        load = _gates_to_load(gates)
+    return gates, load, gates_unselected, expert_mask
 
 # ===== Schedulers/routers =====
 class RecurrentRouter(nn.Module):
@@ -217,6 +398,40 @@ class MoELayer(nn.Module):
 
         elif global_experts is None:
             self.experts = nn.ModuleList([Expert(d_model, d_ff) for _ in range(num_experts)])
+
+    def _init_hypermoe(self, cfg, h):
+        """HyperMoE 파라미터를 미리 등록하는 초기화 함수"""
+        # core
+        self.n_experts = self.num_experts
+        self.k = int(cfg.get("k", 1))
+        self.noisy_gating = bool(cfg.get("noisy_gating", True))
+        self.input_size = h
+        self.output_size = h
+
+        # gates
+        self.w_gate  = nn.Parameter(torch.zeros(h, self.n_experts))
+        self.w_noise = nn.Parameter(torch.zeros(h, self.n_experts))
+        # 초기화 개선 (수렴 속도 향상)
+        nn.init.normal_(self.w_gate,  mean=0.0, std=0.02)
+        nn.init.normal_(self.w_noise, mean=0.0, std=0.02)
+        self.mean = nn.Parameter(torch.tensor([0.0]), requires_grad=False)
+        self.std  = nn.Parameter(torch.tensor([1.0]), requires_grad=False)
+
+        # experts
+        self.experts_hypermoe = nn.ModuleList([Expert(h, h*4, use_gelu=True) for _ in range(self.n_experts)])
+
+        # optional hypernet adapters
+        if cfg.get("use_hypernet", True):
+            self.adapter_layer = AdapterLayer(self.input_size, self.output_size, cfg["adapter_dim"])
+            self.n_experts_embedding = nn.Embedding(self.n_experts, cfg["experts_embedding_dim"])
+            self.embedding_process = nn.Sequential(
+                nn.Linear(cfg["experts_embedding_dim"], cfg["process_dim"]),
+                nn.ReLU(),
+                nn.Linear(cfg["process_dim"], cfg["hypernet_input"]),
+            )
+            self.param_gen = ParameterGenerator(cfg, self.input_size, self.output_size)
+        else:
+            self.adapter_layer = None
 
     @staticmethod
     def _make_finite(x: torch.Tensor) -> torch.Tensor:
@@ -482,7 +697,7 @@ class MoELayer(nn.Module):
                     idx = (top1_idx == eid).nonzero(as_tuple=True)[0]
                     if idx.numel() == 0:
                         continue
-                    sigma_sum = torch.sigmoid(s_full[idx, eid]).sum()
+                    sigma_sum = torch.sigmoid(s_full[idx, eid]).mean()  # sum -> mean 로 스케일 안정화
                     balance = balance + ((idx.numel() - n) / n) * sigma_sum
                 balance_loss = self.stable_balance_alpha * balance
             else:
@@ -516,6 +731,50 @@ class MoELayer(nn.Module):
             self.last_aux["distill"] = distill_loss
 
             return routed, balance_loss, updated_routing_state
+
+        elif self.mode == "hypermoe":
+            """
+            HyperMoE: Top-k(noisy) gating + (옵션) HyperNet 기반 Adapter Fusion
+            필요한 설정은 GPT2LayerMoE에서 전달된 self._hypermoe_cfg 딕셔너리에 있음.
+            """
+            cfg = getattr(self, "_hypermoe_cfg", None)
+            assert cfg is not None, "hypermoe config가 설정되지 않았습니다."
+
+            # 어댑터 파라미터 상태 초기화 (권장사항)
+            if hasattr(self, "adapter_layer") and self.adapter_layer is not None:
+                self.adapter_layer.clear_adapter()
+
+            # ---------- forward ----------
+            res = x
+            x_flat = x.reshape(-1, self.input_size)
+            x_flat = x_flat.to(self.w_gate.dtype)
+            gates, load, gates_out, expert_mask = noisy_top_k_gating_mixing(self, x_flat, self.training)
+            self.last_scores = gates.detach()
+            
+            # importance/load balance loss
+            importance = gates.sum(0)
+            loss_coef = float(cfg.get("loss_coef", 1e-2))
+            balance_loss = (cv_squared(importance) + cv_squared(load)) * loss_coef
+
+            # dispatch → experts → combine
+            dispatcher = SparseDispatcher(self.n_experts, gates)
+            expert_inputs = dispatcher.dispatch(x_flat)
+            expert_outputs = [self.experts_hypermoe[i](expert_inputs[i]) if expert_inputs[i].numel() > 0
+                              else x_flat.new_zeros((0, self.output_size)) for i in range(self.n_experts)]
+            y = dispatcher.combine(expert_outputs).reshape(bsz, seq, self.output_size)
+
+            # (optional) HyperNet adapters fused with unselected experts' embedding summary
+            if cfg.get("use_hypernet", True) and hasattr(self, "adapter_layer") and self.adapter_layer is not None:
+                index_out = torch.nonzero(gates_out)[:, -1].contiguous().flatten()
+                emb = self.n_experts_embedding(index_out)
+                emb = emb.view(res.size(0), res.size(1), self.n_experts - self.k, -1).contiguous()
+                embedding_input = torch.sum(emb, dim=-2)
+                hyp_in = self.embedding_process(embedding_input)
+                uw, dw, ub, db = self.param_gen(hyp_in, cfg["layer_idx"])
+                self.adapter_layer.apply_adapter_params(res.size(0), res.size(1), uw, dw, ub, db)
+                y = self.adapter_layer(res) + y
+
+            return y, balance_loss, updated_routing_state
         
         else:
             raise ValueError(f"Unknown mode: {self.mode}")
@@ -530,7 +789,8 @@ class GPT2LayerMoE(nn.Module):
                  shared_router: RecurrentRouter=None,
                  xmoe_threshold: float = 0.90,
                  xmoe_capacity_factor: float = 1.0,
-                 xmoe_expert_mult: float = 0.25):
+                 xmoe_expert_mult: float = 0.25,
+                 hypermoe_kwargs: dict | None = None):
         super().__init__()
         self.mode = mode
         self.moe = MoELayer(
@@ -548,6 +808,30 @@ class GPT2LayerMoE(nn.Module):
             xmoe_capacity_factor=xmoe_capacity_factor,
             xmoe_expert_mult=xmoe_expert_mult,
         )
+        # HyperMoE용 내부 설정 주입
+        if mode == "hypermoe":
+            # 기본값 채우기
+            d_model = config.n_embd
+            defaults = dict(
+                k=1,
+                noisy_gating=True,
+                use_hypernet=True,
+                adapter_dim=max(16, d_model // 32),
+                hypernet_input=d_model,                # 입력은 [B,L,H]에서 H
+                hypernetwork_bottleneck=max(64, d_model // 8),
+                layer_emb_dim=8,
+                experts_embedding_dim=32,
+                process_dim=max(64, d_model // 8),
+                num_hidden_layers=getattr(config, "n_layer", getattr(config, "num_hidden_layers", 12)),
+                loss_coef=1e-2,
+                layer_idx=(layer_idx if layer_idx is not None else 0),
+            )
+            cfg = {**defaults, **(hypermoe_kwargs or {})}
+            # MoELayer 인스턴스에 저장
+            setattr(self.moe, "_hypermoe_cfg", cfg)
+            # ★ 미리 모듈/파라미터 등록 (optimizer가 잡을 수 있도록)
+            self.moe._init_hypermoe(cfg, config.n_embd)
+
         self.last_balance_loss = None
     def forward(self, hidden_states, input_ids=None, routing_state=None, global_step=None, **kwargs):
         out, balance_loss, updated_routing_state = self.moe(
@@ -654,7 +938,7 @@ def convert_gpt2_to_moe(
         xmoe_capacity_factor = float(max(0.5, min(xmoe_capacity_factor, 8.0)))
         print(f"🧮 XMoE γ auto-scale: base_cf={capacity_factor:.2f}, mult={xmoe_expert_mult:.2f} ⇒ γ={xmoe_capacity_factor:.2f}")
 
-    for block in model.transformer.h:
+    for i, block in enumerate(model.transformer.h):
         if mode == "ours_com":
             block.mlp = GPT2LayerMoE(
                 config, mode, layer_experts,
@@ -665,6 +949,32 @@ def convert_gpt2_to_moe(
                 freq_dict=None,
                 shared_router=shared_router,
             )
+        elif mode == "hypermoe":
+            # HyperMoE 기본 파라미터(원 코드에 맞춤)
+            hypermoe_defaults = dict(
+                k=1,
+                noisy_gating=True,
+                use_hypernet=True,
+                adapter_dim=max(16, config.n_embd // 32),
+                hypernet_input=config.n_embd,
+                hypernetwork_bottleneck=max(64, config.n_embd // 8),
+                layer_emb_dim=8,
+                experts_embedding_dim=32,
+                process_dim=max(64, config.n_embd // 8),
+                num_hidden_layers=getattr(config, "n_layer", getattr(config, "num_hidden_layers", 12)),
+                loss_coef=1e-2,
+                layer_idx=i,   # ★ 각 레이어 인덱스 주입
+            )
+            layer = GPT2LayerMoE(
+                config, mode, num_experts,
+                shared_expert=None,
+                global_experts=None,
+                alpha=alpha,
+                capacity_factor=capacity_factor,
+                freq_dict=None,
+                hypermoe_kwargs=hypermoe_defaults,   # <<< 전달
+            )
+            block.mlp = layer
         else:
             layer = GPT2LayerMoE(
                 config, mode, layer_experts,

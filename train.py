@@ -65,6 +65,11 @@ def compute_moe_stats(model, config, mode):
             entropy = -(probs * (probs + 1e-9).log()).sum().item()
             balance_scores.append(entropy)
             continue
+        if moe.mode == "hypermoe" and getattr(moe, "last_scores", None) is not None:
+            probs = moe.last_scores.mean(0)
+            entropy = -(probs * (probs + 1e-9).log()).sum().item()
+            balance_scores.append(entropy)
+            continue
         if moe.mode == "expert_choice" and moe.last_scores is not None:
             probs = moe.last_scores.mean(0)
             entropy = -(probs * (probs + 1e-9).log()).sum().item()
