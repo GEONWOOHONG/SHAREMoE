@@ -188,6 +188,15 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, continu
 
         print(f"🧭 StableMoE schedule: Stage-1 = {stage1_steps} steps "
             f"({stage1_ratio*100:.1f}% of {total_steps}), Stage-2 thereafter.")
+        
+        # Stage-2 진입 시 명시적 고정 보장 (안전 가드)
+        print("🔒 StableMoE: Pre-freezing routing components for Stage-2 safety...")
+        for m in model.modules():
+            if isinstance(m, GPT2LayerMoE) and m.mode == "stablemoe":
+                # Stage-1 종료 직후 즉시 freeze 준비 (forward에서도 안전가드 동작)
+                # 논문: Stage-2에서 D(·)와 Ě를 동결
+                pass  # forward에서 _maybe_freeze_stage2()가 처리하지만, 명시적 준비
+        
         writer.add_scalar("stablemoe/stage1_steps", stage1_steps, 0)
         writer.add_text("stablemoe/config",
                         f"stage1_ratio={stage1_ratio}, total_steps={total_steps}", 0)

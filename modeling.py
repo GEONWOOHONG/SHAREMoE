@@ -230,10 +230,12 @@ class MoELayer(nn.Module):
     def _maybe_freeze_stage2(self):
         if self.mode != "stablemoe" or self._stage2_frozen:
             return
-        for p in (self.routing_emb.parameters()):
+        for p in self.routing_emb.parameters():
             p.requires_grad_(False)
         self.distill_expert_centroids.requires_grad_(False)
         self._stage2_frozen = True
+        if self.training:
+            print("🔒 StableMoE: Froze routing_emb & distill_E for Stage-2")
 
     def forward(self, x, input_ids=None, routing_state=None, global_step: Optional[int]=None):
         bsz, seq, h = x.shape
@@ -467,6 +469,7 @@ class MoELayer(nn.Module):
 
             # 공통 full-feature affinity와 sigmoid 게이트(두 스테이지 동일 정의)
             s_full = self._make_finite(x_flat @ self.expert_centroids.t())        # [N, E]
+            s_full = s_full.to(x_flat.dtype)
             s_top1 = s_full.gather(1, top1_idx.view(-1,1))                        # [N,1]
             gate_sigmoid = torch.sigmoid(s_top1)                                  # [N,1]
 
@@ -631,6 +634,10 @@ def convert_gpt2_to_moe(
     shared_router = None
     layer_experts = num_experts
 
+    # --- StableMoE 전용: 모든 레이어가 공유할 라우터 weight와 distilled centroids ---
+    shared_routing_weight = None
+    shared_distill_E = None
+
     if mode == "ours_com":
         assert num_experts >= 2, "ours_com requires at least 2 experts (1 local + N global)."
         global_experts = nn.ModuleList([
@@ -640,14 +647,10 @@ def convert_gpt2_to_moe(
         shared_router = RecurrentRouter(d_model=config.n_embd, hidden_dim=config.n_embd)
         layer_experts = 1
 
-    # --- XMoE 전용: γ(capacity factor) 자동 스케일링 ---
     if mode == "xmoe":
-        # 논문 취지: expert dimension이 작아질수록 γ를 키워 FLOPs를 정합
-        # D_base = 4*d_model, D_x = D_base * xmoe_expert_mult => D_base / D_x = 1 / xmoe_expert_mult
         if xmoe_capacity_factor is None:
             scale = 1.0 / max(1e-6, float(xmoe_expert_mult))
             xmoe_capacity_factor = float(capacity_factor) * scale
-        # (선택) 현실적 가드레일: 너무 극단적인 γ 방지
         xmoe_capacity_factor = float(max(0.5, min(xmoe_capacity_factor, 8.0)))
         print(f"🧮 XMoE γ auto-scale: base_cf={capacity_factor:.2f}, mult={xmoe_expert_mult:.2f} ⇒ γ={xmoe_capacity_factor:.2f}")
 
@@ -678,7 +681,26 @@ def convert_gpt2_to_moe(
                 layer.moe.vocab_size = getattr(config, "vocab_size", 50257)
                 layer.moe.stable_routing_dim = stable_routing_dim
                 layer.moe.stable_balance_alpha = stable_balance_alpha
-                # 라우터 임베딩 재생성(레이어별 공유가 아니라 각 레이어 독립이면 그대로, 공유하려면 밖에서 참조 공유)
+                
+                # 1) shared weight / shared distill_E 최초 1회 생성
+                if shared_routing_weight is None:
+                    shared_routing_weight = nn.Parameter(
+                        torch.empty(layer.moe.vocab_size, layer.moe.stable_routing_dim)
+                    )
+                    nn.init.normal_(shared_routing_weight, mean=0.0, std=0.02)  # 임의 초기화
+                    print(f"🔹 StableMoE: Created shared routing weight ({layer.moe.vocab_size}, {layer.moe.stable_routing_dim})")
+                if shared_distill_E is None:
+                    shared_distill_E = nn.Parameter(
+                        torch.empty(layer.moe.num_experts, layer.moe.stable_routing_dim)
+                    )
+                    nn.init.orthogonal_(shared_distill_E, gain=0.1)
+                    print(f"🔹 StableMoE: Created shared distilled centroids ({layer.moe.num_experts}, {layer.moe.stable_routing_dim})")
+
+                # 2) 각 레이어는 "자기 임베딩 모듈"을 갖되, weight는 모두 같은 파라미터를 바라보게 tying
                 layer.moe.routing_emb = nn.Embedding(layer.moe.vocab_size, layer.moe.stable_routing_dim)
+                layer.moe.routing_emb.weight = shared_routing_weight  # <-- 핵심: 파라미터 공유
+
+                # 3) distill_E도 동일 파라미터 객체를 공유
+                layer.moe.distill_expert_centroids = shared_distill_E
             block.mlp = layer
     return model
