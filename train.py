@@ -225,7 +225,6 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
             model,
             device_ids=[local_rank],
             output_device=local_rank,
-            find_unused_parameters=True,
             gradient_as_bucket_view=True,
             broadcast_buffers=False,
         )

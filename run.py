@@ -86,13 +86,6 @@ os.makedirs(os.environ["HF_DATASETS_CACHE"], exist_ok=True)
 
 setup_nccl_env_safely()
 
-try:
-    import torch
-    if torch.cuda.is_available():
-        os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
-except Exception:
-    os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
-
 import argparse
 from config import HASH_TABLE_PATH
 from utils import set_current_input_ids, get_current_input_ids
