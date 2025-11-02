@@ -685,11 +685,12 @@ class MoELayer(nn.Module):
                         pass
                 if input_ids is None:
                     raise ValueError("stablemoe mode requires input_ids for routing.")
-                with torch.no_grad():  # stage2 라우팅 고정
+                with torch.no_grad():  # stage2 라우팅 전체를 진짜로 고정
                     root = self._stable_root_ref() if hasattr(self, "_stable_root_ref") else None
                     assert root is not None, "StableMoE root ref missing"
                     rfeat = F.embedding(input_ids.view(-1), root.stablemoe_routing_weight)
-                affinities = rfeat @ root.stablemoe_distill_E.t()
+                    E = root.stablemoe_distill_E
+                    affinities = rfeat @ E.t()
                 distill_loss = None
             else:
                 # Stage-1: full feat로 라우팅 + distill target/CE
@@ -713,13 +714,14 @@ class MoELayer(nn.Module):
 
                 E = root.stablemoe_distill_E
                 is_primary = (getattr(self, "_layer_idx", 0) == 0)
+
                 if not is_primary:
+                    rfeat = rfeat.detach()
                     E = E.detach()
 
                 logits_d = rfeat @ E.t()
                 distill_loss = F.cross_entropy(logits_d, target, reduction="mean") if is_primary else None
 
-            # --- greedy top-1 assignment + capacity 컷 ---
             top1_idx = affinities.argmax(dim=1)                           # [N]
             # capacity per expert
             cap = int(math.ceil(N / self.num_experts) * self.capacity_factor)
