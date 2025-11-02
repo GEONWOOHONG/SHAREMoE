@@ -278,6 +278,7 @@ class XMoEThresholdRouter(nn.Module):
         R = torch.empty_like(R_sorted)
         R.scatter_(dim=1, index=idx_sorted, src=R_sorted)
         capacity = int(math.ceil(N / self.num_experts) * self.capacity_factor)
+        capacity = max(1, capacity)
         R_col_sorted_vals, R_col_sorted_tok = torch.sort(R, dim=0, descending=True)
         keep_flags = torch.zeros_like(R, dtype=torch.bool)
         C = min(capacity, N)
@@ -417,6 +418,33 @@ class MoELayer(nn.Module):
         elif global_experts is None and mode not in {"hypermoe"}:
             self.experts = nn.ModuleList([Expert(d_model, d_ff) for _ in range(num_experts)])
 
+    def _ddp_probe_loss_hyper(self, dtype, device, alpha=1e-8):
+        if not hasattr(self, "experts_hypermoe"):
+            return None
+        d = self.input_size
+        probe = torch.randn(8, d, device=device, dtype=dtype) * 1e-3
+        loss = None
+        for e in self.experts_hypermoe:
+            y = e(probe)
+            l = (y**2).mean()
+            loss = l if loss is None else (loss + l)
+        return alpha * loss if loss is not None else None
+
+    def _ddp_probe_loss(self, dtype, device, alpha=1e-8, n_proj=1):
+        if not hasattr(self, "experts"):
+            return None
+        d = self.d_model
+        loss = None
+        for _ in range(n_proj):
+            probe = torch.randn(8, d, device=device, dtype=dtype) * 1e-3
+            for e in self.experts:
+                y = e(probe)
+                l = (y**2).mean()
+                loss = l if loss is None else (loss + l)
+        if loss is None:
+            return None
+        return alpha * loss
+
     def _init_hypermoe(self, cfg, h, shared: Optional[nn.Module]=None):
         """HyperMoE 파라미터 초기화 (+선택적으로 cross-layer shared 모듈 주입)"""
         self.n_experts = self.num_experts
@@ -469,7 +497,7 @@ class MoELayer(nn.Module):
         return x
 
     def _maybe_freeze_stage2(self):
-        if self.mode != "stablemoe" or self._stage2_frozen:
+        if self.mode != "stablemoe" or self._stage2_frozen or (not self.training):
             return
         # 루트 모델 파라미터를 얼린다
         root = self._stable_root_ref() if hasattr(self, "_stable_root_ref") else None
@@ -515,6 +543,11 @@ class MoELayer(nn.Module):
                     expert_out = experts[eid](x_flat[keep]) * top_scores[keep]
                     out_flat[keep] = expert_out.to(out_flat.dtype)
             routed_out = out_flat.view(bsz, seq, h)
+
+            probe = self._ddp_probe_loss(dtype=x.dtype, device=x.device, alpha=getattr(self, "ddp_probe_alpha", 1e-8))
+            if probe is not None:
+                balance_loss = (balance_loss if balance_loss is not None else 0.0) + probe
+
             return routed_out, balance_loss, updated_routing_state
 
         elif self.mode == "gshard":
@@ -543,6 +576,11 @@ class MoELayer(nn.Module):
                             expert_out = experts[eid](x_flat[keep]) * score[:keep.size(0)]
                             out_flat[keep] = (out_flat[keep] + expert_out.to(out_flat.dtype))
             routed_out = out_flat.view(bsz, seq, h)
+
+            probe = self._ddp_probe_loss(dtype=x.dtype, device=x.device, alpha=getattr(self, "ddp_probe_alpha", 1e-8))
+            if probe is not None:
+                balance_loss = (balance_loss if balance_loss is not None else 0.0) + probe
+
             return routed_out, balance_loss, updated_routing_state
 
         elif self.mode == "ours_com":
@@ -590,6 +628,23 @@ class MoELayer(nn.Module):
                 aux_loss = (Pi * fi).sum() * self.aux_alpha
 
             routed_out = local_out + global_out
+
+            alpha = getattr(self, "ddp_probe_alpha", 1e-8)
+            probe = self._ddp_probe_loss(dtype=x.dtype, device=x.device, alpha=alpha)  # local expert들
+            # global_experts도 1회씩 통과
+            if hasattr(self, "global_experts") and self.global_experts is not None:
+                d = self.d_model
+                p = torch.randn(8, d, device=x.device, dtype=x.dtype) * 1e-3
+                g_loss = None
+                for e in self.global_experts:
+                    y = e(p); l = (y**2).mean()
+                    g_loss = l if g_loss is None else (g_loss + l)
+                if g_loss is not None:
+                    probe = (probe if probe is not None else 0.0) + alpha * g_loss
+
+            if probe is not None:
+                aux_loss = (aux_loss if aux_loss is not None else 0.0) + probe
+
             return routed_out, aux_loss, h_new
 
         elif self.mode == "hash":
@@ -609,6 +664,10 @@ class MoELayer(nn.Module):
                     expert_out = self.experts[eid](x_flat[idx])
                     out_flat[idx] = expert_out.to(out_flat.dtype)
             routed_out = out_flat.view(bsz, seq, h)
+
+            probe = self._ddp_probe_loss(dtype=x.dtype, device=x.device, alpha=getattr(self, "ddp_probe_alpha", 1e-8))
+            balance_loss = probe
+
             return routed_out, None, updated_routing_state
 
         elif self.mode == "expert_choice":
@@ -630,6 +689,11 @@ class MoELayer(nn.Module):
                     score = weights[eid].unsqueeze(-1)
                     out_flat.index_add_(0, token_indices, expert_output * score)
             routed_out = out_flat.view(bsz, seq, h)
+
+            probe = self._ddp_probe_loss(dtype=x.dtype, device=x.device, alpha=getattr(self, "ddp_probe_alpha", 1e-8))
+            if probe is not None:
+                balance_loss = (balance_loss if balance_loss is not None else 0.0) + probe
+
             return routed_out, balance_loss, updated_routing_state
 
         elif self.mode == "xmoe":
@@ -649,6 +713,11 @@ class MoELayer(nn.Module):
             routed_out = out_flat.view(bsz, seq, H)
             self.last_scores = self.xmoe_router.last_scores
             balance_loss = aux_loss
+
+            probe = self._ddp_probe_loss(dtype=x.dtype, device=x.device, alpha=getattr(self, "ddp_probe_alpha", 1e-8))
+            if probe is not None:
+                balance_loss = (balance_loss if balance_loss is not None else 0.0) + probe
+
             return routed_out, balance_loss, updated_routing_state
 
         elif self.mode == "stablemoe":
@@ -774,6 +843,10 @@ class MoELayer(nn.Module):
             self.last_aux["balance"] = (None if is_stage2 else (balance_loss - (distill_loss or 0.0)))
             self.last_aux["distill"] = distill_loss
 
+            probe = self._ddp_probe_loss(dtype=x.dtype, device=x.device, alpha=getattr(self, "ddp_probe_alpha", 1e-8))
+            if probe is not None:
+                balance_loss = (balance_loss if balance_loss is not None else 0.0) + probe
+
             return routed, balance_loss, updated_routing_state
 
         elif self.mode == "hypermoe":
@@ -817,6 +890,10 @@ class MoELayer(nn.Module):
                 uw, dw, ub, db = self.param_gen(hyp_in, cfg["layer_idx"])
                 self.adapter_layer.apply_adapter_params(res.size(0), res.size(1), uw, dw, ub, db)
                 y = self.adapter_layer(res) + y
+
+            probe = self._ddp_probe_loss_hyper(dtype=x.dtype, device=x.device, alpha=getattr(self, "ddp_probe_alpha", 1e-8))
+            if probe is not None:
+                balance_loss = (balance_loss if balance_loss is not None else 0.0) + probe
 
             return y, balance_loss, updated_routing_state
         
