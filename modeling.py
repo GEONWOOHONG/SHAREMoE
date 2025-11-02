@@ -693,7 +693,7 @@ class MoELayer(nn.Module):
                     affinities = rfeat @ E.t()
                 distill_loss = None
             else:
-                # Stage-1: full feat로 라우팅 + distill target/CE
+                # Stage-1: full feat로 라우팅 + (오직 레이어 0)에서만 distill CE
                 affinities = x_flat @ self.expert_centroids.t()           # [N, E]
                 affinities = self._make_finite(affinities)
                 if input_ids is None:
@@ -704,23 +704,21 @@ class MoELayer(nn.Module):
                         pass
                 if input_ids is None:
                     raise ValueError("stablemoe mode requires input_ids during Stage-1.")
-                # distill target 생성은 동일
+
                 with torch.no_grad():
                     target = affinities.argmax(dim=1)                    # [N]
-                # 경량 라우터 logits_d = E_routing(x_ids) · E_distill^T
-                root = self._stable_root_ref() if hasattr(self, "_stable_root_ref") else None
-                assert root is not None, "StableMoE root ref missing"
-                rfeat = F.embedding(input_ids.view(-1), root.stablemoe_routing_weight)
 
-                E = root.stablemoe_distill_E
                 is_primary = (getattr(self, "_layer_idx", 0) == 0)
-
-                if not is_primary:
-                    rfeat = rfeat.detach()
-                    E = E.detach()
-
-                logits_d = rfeat @ E.t()
-                distill_loss = F.cross_entropy(logits_d, target, reduction="mean") if is_primary else None
+                if is_primary:
+                    root = self._stable_root_ref() if hasattr(self, "_stable_root_ref") else None
+                    assert root is not None, "StableMoE root ref missing"
+                    rfeat = F.embedding(input_ids.view(-1), root.stablemoe_routing_weight)  # needs grad
+                    E = root.stablemoe_distill_E  # needs grad
+                    logits_d = rfeat @ E.t()
+                    distill_loss = F.cross_entropy(logits_d, target, reduction="mean")
+                else:
+                    # 비-주 레이어는 distill/경량 라우터 경로를 전혀 만들지 않음 (E 접근 금지)
+                    distill_loss = None
 
             top1_idx = affinities.argmax(dim=1)                           # [N]
             # capacity per expert

@@ -352,8 +352,11 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
                     main_loss = chunked_cross_entropy(logits, labels, ignore_index=-100, chunk_tokens=8192)
 
                 balance_losses = [m.last_balance_loss for m in model.modules()
-                                if isinstance(m, GPT2LayerMoE) and m.last_balance_loss is not None]
-                aux_loss = torch.stack(balance_losses).mean() if balance_losses else 0.0
+                                  if isinstance(m, GPT2LayerMoE) and (m.last_balance_loss is not None)]
+                if balance_losses:
+                    aux_loss = torch.stack(balance_losses).mean()
+                else:
+                    aux_loss = torch.zeros((), device=main_loss.device, dtype=main_loss.dtype)
                 loss = main_loss + aux_loss
 
                 # StableMoE 분해 로깅 (생략 가능)
