@@ -204,11 +204,11 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
              effective_batch=batch_size * (world_size if is_dist else 1) * grad_accum)
 
     if is_main() and not os.path.exists(os.path.join(save_dir, "config.json")):
-        config = _fix_loss_type(config)
+        config.loss_type = "ForCausalLMLoss"
         config.save_pretrained(save_dir)
 
     model.to(device)
-    base_model = model  # 저장/통계용 원본
+    base_model = model
     if is_dist:
         model = DDP(
             model,
