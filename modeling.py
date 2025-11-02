@@ -710,8 +710,14 @@ class MoELayer(nn.Module):
                 root = self._stable_root_ref() if hasattr(self, "_stable_root_ref") else None
                 assert root is not None, "StableMoE root ref missing"
                 rfeat = F.embedding(input_ids.view(-1), root.stablemoe_routing_weight)
-                logits_d = rfeat @ root.stablemoe_distill_E.t()
-                distill_loss = F.cross_entropy(logits_d, target, reduction="mean")
+
+                E = root.stablemoe_distill_E
+                is_primary = (getattr(self, "_layer_idx", 0) == 0)
+                if not is_primary:
+                    E = E.detach()
+
+                logits_d = rfeat @ E.t()
+                distill_loss = F.cross_entropy(logits_d, target, reduction="mean") if is_primary else None
 
             # --- greedy top-1 assignment + capacity 컷 ---
             top1_idx = affinities.argmax(dim=1)                           # [N]
@@ -762,10 +768,9 @@ class MoELayer(nn.Module):
                     out_flat[drop] = x_flat[drop]
 
             routed = out_flat.view(bsz, seq, h)
-            # distill_loss를 balance_loss에 합산해 기존 인터페이스 유지
             if distill_loss is not None:
                 balance_loss = (balance_loss if balance_loss is not None else 0.0) + distill_loss
-            # 분리 로깅
+
             self.last_aux["balance"] = (None if is_stage2 else (balance_loss - (distill_loss or 0.0)))
             self.last_aux["distill"] = distill_loss
 
@@ -847,6 +852,8 @@ class GPT2LayerMoE(nn.Module):
             xmoe_capacity_factor=xmoe_capacity_factor,
             xmoe_expert_mult=xmoe_expert_mult,
         )
+        self.layer_idx = 0 if layer_idx is None else int(layer_idx)
+        setattr(self.moe, "_layer_idx", self.layer_idx)
         # HyperMoE용 내부 설정 주입
         if mode == "hypermoe":
             # 기본값 채우기
@@ -1030,6 +1037,7 @@ def convert_gpt2_to_moe(
                 capacity_factor=capacity_factor,
                 freq_dict=None,
                 shared_router=shared_router,
+                layer_idx=i,
             )
         elif mode == "hypermoe":
             # HyperMoE 기본 파라미터(원 코드에 맞춤)
@@ -1046,7 +1054,6 @@ def convert_gpt2_to_moe(
                 num_hidden_layers=getattr(config, "n_layer", getattr(config, "num_hidden_layers", 12)),
                 loss_coef=1e-2,
                 layer_idx=i,
-                # ★ 공유팩을 kwargs로 넘겨 GPT2LayerMoE가 _init_hypermoe(..., shared=...) 호출할 수 있게
                 _shared_pack=hypermoe_shared_pack,
             )
             layer = GPT2LayerMoE(
@@ -1056,7 +1063,8 @@ def convert_gpt2_to_moe(
                 alpha=alpha,
                 capacity_factor=capacity_factor,
                 freq_dict=None,
-                hypermoe_kwargs=hypermoe_defaults,   # <<< 전달
+                hypermoe_kwargs=hypermoe_defaults,
+                layer_idx=i,
             )
             block.mlp = layer
         else:
@@ -1070,14 +1078,13 @@ def convert_gpt2_to_moe(
                 xmoe_threshold=xmoe_threshold,
                 xmoe_capacity_factor=xmoe_capacity_factor,
                 xmoe_expert_mult=xmoe_expert_mult,
+                layer_idx=i,  # ★ 추가
             )
             if mode == "stablemoe":
                 layer.moe.vocab_size = getattr(config, "vocab_size", 50257)
                 layer.moe.stable_routing_dim = stable_routing_dim
                 layer.moe.stable_balance_alpha = stable_balance_alpha
-                
                 import weakref
                 object.__setattr__(layer.moe, "_stable_root_ref", weakref.ref(model))
-                
             block.mlp = layer
     return model
