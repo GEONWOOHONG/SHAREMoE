@@ -161,15 +161,15 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
         patch_model_for_ours_com(model)
     elif mode == "stablemoe":
         patch_model_for_stablemoe(model)
-    
-    if is_main() and mode != "dense":
-        print(f"🔹 Applying forward patches for mode: {mode}")
 
+    if mode != "dense":
+        if is_main():
+            print(f"🔹 Applying forward patches for mode: {mode}")
         patch_model_basic(model)
 
     train_dataset, valid_dataset = load_or_prepare_pile(verbose=is_main())
     if is_main():
-        print(f"✅ Using FULL datasets: train={len(train_dataset):,}, valid={len(valid_dataset):,}")
+        print(f"Using FULL datasets: train={len(train_dataset):,}, valid={len(valid_dataset):,}")
 
     train_dataset.set_format(type="torch", columns=["input_ids", "attention_mask"])
     valid_dataset.set_format(type="torch", columns=["input_ids", "attention_mask"])
