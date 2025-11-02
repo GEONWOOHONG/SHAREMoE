@@ -476,6 +476,11 @@ class MoELayer(nn.Module):
             self.n_experts_embedding  = shared.n_experts_embedding
             self.embedding_process    = shared.embedding_process
             self.param_gen            = shared.param_gen
+
+            for p in self.adapter_layer.adapter_down_manual.parameters():
+                p.requires_grad_(False)
+            for p in self.adapter_layer.adapter_up_manual.parameters():
+                p.requires_grad_(False)
         else:
             # (구버전과 동일: 레이어마다 따로 생성) ← 이제는 쓰지 않을 경로
             self.adapter_layer = AdapterLayer(self.input_size, self.output_size, cfg["adapter_dim"])
