@@ -25,17 +25,6 @@ ensure_flash_attn()  # 원본과 동일하게 모듈 레벨에서 즉시 호출
 
 enc = tiktoken.get_encoding("gpt2")
 
-def _fix_loss_type(config: GPT2Config):
-    # 최신 Transformers는 recognized string이 필요합니다.
-    # 경고 없이 기본 Causal LM loss를 쓰려면 이렇게 고정하세요.
-    try:
-        config.loss_type = "ForCausalLMLoss"
-    except Exception:
-        # 혹시 구버전이면 키 자체를 제거
-        if hasattr(config, "loss_type"):
-            delattr(config, "loss_type")
-    return config
-
 def init_distributed():
     """torchrun 환경이면 DDP 초기화하고 (is_dist, rank, world_size, local_rank) 반환"""
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
@@ -138,8 +127,8 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
     if continue_training:
         print("🔄 Loading model from last checkpoint...")
         config = GPT2Config.from_pretrained(save_dir)
-        config = _fix_loss_type(config)
         model = GPT2LMHeadModel(config)
+        model.config.loss_type = "ForCausalLMLoss"
         model = convert_gpt2_to_moe(
             model, config, mode=mode, num_experts=eff_num_experts, alpha=0.01, freq_dict=freq_dict
         )
@@ -153,8 +142,8 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
         print(f"🔹 Restoring optimizer/scheduler from {trainer_path}")
     else:
         config = GPT2Config(vocab_size=50257, n_positions=1024, n_ctx=1024, n_embd=1024, n_layer=8, n_head=8)
-        config = _fix_loss_type(config)
         model = GPT2LMHeadModel(config)
+        model.config.loss_type = "ForCausalLMLoss"
         stable_args = dict(stable_routing_dim=50, stable_balance_alpha=0.3)
         
         model = convert_gpt2_to_moe(
