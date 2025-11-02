@@ -545,8 +545,7 @@ class MoELayer(nn.Module):
             routed_out = out_flat.view(bsz, seq, h)
 
             probe = self._ddp_probe_loss(dtype=x.dtype, device=x.device, alpha=getattr(self, "ddp_probe_alpha", 1e-8))
-            if probe is not None:
-                balance_loss = (balance_loss if balance_loss is not None else 0.0) + probe
+            balance_loss = probe
 
             return routed_out, balance_loss, updated_routing_state
 
