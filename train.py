@@ -194,6 +194,9 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
         worker_init_fn=worker_init_fn, generator=valid_generator
     )
 
+    num_batches = len(train_loader)
+    optim_steps_per_epoch = math.ceil(num_batches / grad_accum)
+
     from utils import print_model_info as _pmi
     if is_main():
         _pmi(model, config, mode, eff_num_experts, batch_size=batch_size, grad_accum_steps=grad_accum,
@@ -224,19 +227,21 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
 
     if continue_training and trainer_state is not None:
         optimizer.load_state_dict(trainer_state["optimizer"])
-        total_steps = trainer_state.get("total_train_steps", len(train_loader))
+        # 총 옵티 스텝 수를 복원(없으면 현재 에폭의 추정치 사용)
+        total_steps = trainer_state.get("total_train_steps", optim_steps_per_epoch)
         scheduler = get_default_scheduler(optimizer, total_steps, warmup_ratio=0.1)
         if "scheduler" in trainer_state:
             scheduler.load_state_dict(trainer_state["scheduler"])
         best_loss   = trainer_state["best_loss"]
-        start_step  = trainer_state["step"]
+        start_step  = trainer_state["step"]  # 주의: 이건 'optim_step'으로 해석할 예정
         try:
             print("🔎 Resume LR:", scheduler.get_last_lr()[0])
         except Exception:
             print("🔎 Resume LR (param_group[0]):", optimizer.param_groups[0]["lr"])
         print(f"🔹 Resumed training from step {start_step}, best_loss={best_loss:.4f}")
     else:
-        total_steps = len(train_loader)
+        # 한 에폭만 학습하므로 해당 에폭 내 옵티 스텝 수
+        total_steps = optim_steps_per_epoch
         scheduler   = get_default_scheduler(optimizer, total_steps, warmup_ratio=0.1)
         best_loss   = float("inf")
         start_step  = 0
@@ -277,11 +282,12 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
     five_percent_interval = max(1, total_train_steps // 20)
 
     num_epochs = 1
+    optim_step = start_step
     for epoch in range(num_epochs):
         if is_dist and train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
-        for step, batch in enumerate(train_loader, start=start_step + 1):
+        for step, batch in enumerate(train_loader, start=1):
             input_ids = batch["input_ids"].to(device)
             labels = input_ids.clone()
             labels[labels == enc.eot_token] = -100
@@ -320,13 +326,39 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
 
                 (loss / grad_accum).backward()
 
-            # ⬇️ 이 블록들 모두 inner for 안에 있어야 함
             if sync_now:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
+                optim_step += 1  # ✅ 옵티 스텝 증가
 
+                # 🔹 LR 로깅은 옵티 스텝 기준
+                if writer and (optim_step % 50 == 0):
+                    writer.add_scalar("train/lr", scheduler.get_last_lr()[0], optim_step)
+
+                # 🔹 검증도 옵티 스텝 기준
+                if (optim_step % five_percent_interval == 0) or (optim_step == point_one_step):
+                    msg = ("🔍 Full validation (every 5%) at optim step "
+                        f"{optim_step}..." if (optim_step % five_percent_interval == 0)
+                        else f"🔍 Quick validation (0.1%) at optim step {optim_step}...")
+                    if progress_bar:
+                        progress_bar.write(msg)
+
+                    valid_loss, valid_ppl = evaluate(model, valid_loader, device)
+                    stats = compute_moe_stats(base_model, config, mode) if (optim_step % five_percent_interval == 0) else {"balance": 0.0}
+
+                    if is_main():
+                        if optim_step % five_percent_interval == 0:
+                            print(f"[OptStep {optim_step}] Valid Loss {valid_loss:.4f}, PPL {valid_ppl:.2f}, Balance {stats['balance']:.4f}")
+                            if writer:
+                                writer.add_scalar("valid/balance", stats["balance"], optim_step)
+                        if writer:
+                            writer.add_scalar("valid/loss", valid_loss, optim_step)
+                            writer.add_scalar("valid/ppl", valid_ppl, optim_step)
+                        if valid_loss < best_loss:
+                            best_loss = valid_loss
+                            save_checkpoint(base_model, optimizer, scheduler, optim_step, best_loss, total_train_steps, save_dir, "best_checkpoint.safetensors")
             if progress_bar:
                 progress_bar.update(1)
                 progress_bar.set_postfix(
@@ -334,38 +366,11 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
                     main=main_loss.item(),
                     aux=aux_loss.item() if isinstance(aux_loss, torch.Tensor) else 0.0
                 )
-            if writer:
-                writer.add_scalar("train/loss", loss.item(), step)
-                if step % 50 == 0:
-                    writer.add_scalar("train/lr", scheduler.get_last_lr()[0], step)
-
-            if step % five_percent_interval == 0 or step == point_one_step:
-                msg = (f"🔍 Full validation (every 5%) at step {step}..."
-                    if step % five_percent_interval == 0
-                    else f"🔍 Quick validation (0.1%) at step {step}...")
-                if progress_bar:
-                    progress_bar.write(msg)
-
-                valid_loss, valid_ppl = evaluate(model, valid_loader, device)
-                stats = compute_moe_stats(base_model, config, mode) if (step % five_percent_interval == 0) else {"balance": 0.0}
-
-                if is_main():
-                    if step % five_percent_interval == 0:
-                        print(f"[Step {step}] Valid Loss {valid_loss:.4f}, PPL {valid_ppl:.2f}, Balance {stats['balance']:.4f}")
-                        if writer:
-                            writer.add_scalar("valid/balance", stats["balance"], step)
-                    if writer:
-                        writer.add_scalar("valid/loss", valid_loss, step)
-                        writer.add_scalar("valid/ppl", valid_ppl, step)
-                    if valid_loss < best_loss:
-                        best_loss = valid_loss
-                        save_checkpoint(base_model, optimizer, scheduler, step, best_loss, total_train_steps, save_dir, "best_checkpoint.safetensors")
-
-        if writer and step % 50 == 0:
-            writer.add_scalar("train/lr", scheduler.get_last_lr()[0], step)
-
+                
     if progress_bar: progress_bar.close()
+
     if is_main():
-        save_checkpoint(base_model, optimizer, scheduler, step, best_loss, total_train_steps, save_dir, "last_checkpoint.safetensors")
+        save_checkpoint(base_model, optimizer, scheduler, optim_step, best_loss, total_train_steps, save_dir, "last_checkpoint.safetensors")
+    
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
