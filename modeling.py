@@ -414,9 +414,8 @@ class MoELayer(nn.Module):
             self.register_buffer("_num_updates_buf", torch.zeros((), dtype=torch.long))
             self._stage2_frozen = False
             
-            # 전역 공유 파라미터 참조는 convert_gpt2_to_moe에서 주입됨
-            self._stable_routing_weight = None  # Tensor 참조
-            self._stable_distill_E = None       # Tensor 참조
+            # 루트 모델 참조만 들고 있고, 파라미터는 루트에만 등록
+            self._stable_root = None            # weakref.proxy(model) 또는 model
 
         elif global_experts is None and mode not in {"hypermoe"}:
             self.experts = nn.ModuleList([Expert(d_model, d_ff) for _ in range(num_experts)])
@@ -688,9 +687,10 @@ class MoELayer(nn.Module):
                 if input_ids is None:
                     raise ValueError("stablemoe mode requires input_ids for routing.")
                 with torch.no_grad():  # stage2 라우팅 고정
-                    # 전역 공유 weight를 함수형 embedding으로 조회
-                    rfeat = F.embedding(input_ids.view(-1), self._stable_routing_weight)    # ✅
-                affinities = rfeat @ self._stable_distill_E.t()                          # ✅
+                    root = self._stable_root
+                    assert root is not None, "StableMoE root ref missing"
+                    rfeat = F.embedding(input_ids.view(-1), root.stablemoe_routing_weight)
+                affinities = rfeat @ root.stablemoe_distill_E.t()
                 distill_loss = None
             else:
                 # Stage-1: full feat로 라우팅 + distill target/CE
@@ -708,8 +708,10 @@ class MoELayer(nn.Module):
                 with torch.no_grad():
                     target = affinities.argmax(dim=1)                    # [N]
                 # 경량 라우터 logits_d = E_routing(x_ids) · E_distill^T
-                rfeat = F.embedding(input_ids.view(-1), self._stable_routing_weight)    # ✅
-                logits_d = rfeat @ self._stable_distill_E.t()                            # ✅
+                root = self._stable_root
+                assert root is not None, "StableMoE root ref missing"
+                rfeat = F.embedding(input_ids.view(-1), root.stablemoe_routing_weight)
+                logits_d = rfeat @ root.stablemoe_distill_E.t()
                 distill_loss = F.cross_entropy(logits_d, target, reduction="mean")
 
             # --- greedy top-1 assignment + capacity 컷 ---
@@ -1075,9 +1077,10 @@ def convert_gpt2_to_moe(
                 layer.moe.stable_routing_dim = stable_routing_dim
                 layer.moe.stable_balance_alpha = stable_balance_alpha
                 
-                # (B) 각 레이어에는 "참조"만 심는다 (등록 X)
-                layer.moe._stable_routing_weight = model.stablemoe_routing_weight   # Tensor 참조
-                layer.moe._stable_distill_E      = model.stablemoe_distill_E        # Tensor 참조
+                # 파라미터 자체를 서브모듈에 다시 등록하지 말 것!
+                # 루트 모델에만 등록하고, 레이어에는 루트 참조만 저장
+                import weakref
+                layer.moe._stable_root = weakref.proxy(model)  # 또는 그냥 model 참조를 넣어도 됨
                 
             block.mlp = layer
     return model

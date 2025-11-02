@@ -191,16 +191,13 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
             **(stable_args if mode == "stablemoe" else {})
         )
 
-    if mode == "hash":
+    if mode == "stablemoe":
+        patch_model_for_stablemoe(model)
+    elif mode == "hash":
         patch_model_for_hash_moe(model)
     elif mode == "ours_com":
         patch_model_for_ours_com(model)
-    elif mode == "stablemoe":
-        patch_model_for_stablemoe(model)
-
-    if mode != "dense":
-        if is_main():
-            print(f"🔹 Applying forward patches for mode: {mode}")
+    else:
         patch_model_basic(model)
 
     train_dataset, valid_dataset = load_or_prepare_pile(verbose=is_main())
