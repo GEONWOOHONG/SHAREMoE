@@ -21,11 +21,20 @@ from utils import (set_seed, get_default_optimizer, get_default_scheduler,
 
 from torch.utils.tensorboard import SummaryWriter
 
-# 환경 변수는 사용자 환경에서 설정했다고 가정 (원본 주석 유지 불필요)
-
 ensure_flash_attn()  # 원본과 동일하게 모듈 레벨에서 즉시 호출
 
 enc = tiktoken.get_encoding("gpt2")
+
+def _fix_loss_type(config: GPT2Config):
+    # 최신 Transformers는 recognized string이 필요합니다.
+    # 경고 없이 기본 Causal LM loss를 쓰려면 이렇게 고정하세요.
+    try:
+        config.loss_type = "ForCausalLMLoss"
+    except Exception:
+        # 혹시 구버전이면 키 자체를 제거
+        if hasattr(config, "loss_type"):
+            delattr(config, "loss_type")
+    return config
 
 def init_distributed():
     """torchrun 환경이면 DDP 초기화하고 (is_dist, rank, world_size, local_rank) 반환"""
@@ -129,6 +138,7 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
     if continue_training:
         print("🔄 Loading model from last checkpoint...")
         config = GPT2Config.from_pretrained(save_dir)
+        config = _fix_loss_type(config)
         model = GPT2LMHeadModel(config)
         model = convert_gpt2_to_moe(
             model, config, mode=mode, num_experts=eff_num_experts, alpha=0.01, freq_dict=freq_dict
@@ -143,6 +153,7 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
         print(f"🔹 Restoring optimizer/scheduler from {trainer_path}")
     else:
         config = GPT2Config(vocab_size=50257, n_positions=1024, n_ctx=1024, n_embd=1024, n_layer=8, n_head=8)
+        config = _fix_loss_type(config)
         model = GPT2LMHeadModel(config)
         stable_args = dict(stable_routing_dim=50, stable_balance_alpha=0.3)
         
@@ -204,18 +215,19 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
              effective_batch=batch_size * (world_size if is_dist else 1) * grad_accum)
 
     if is_main() and not os.path.exists(os.path.join(save_dir, "config.json")):
+        config = _fix_loss_type(config)
         config.save_pretrained(save_dir)
 
     model.to(device)
     base_model = model  # 저장/통계용 원본
     if is_dist:
         model = DDP(
-            model, 
-            device_ids=[local_rank], 
-            output_device=local_rank, 
-            find_unused_parameters=False,
-            gradient_as_bucket_view=True,   # bucket 뷰 사용으로 메모리/속도 이점
-            broadcast_buffers=False         # 불필요한 buffer 브로드캐스트 비활성 (통계 buffer 없으면 권장)
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=True,
+            gradient_as_bucket_view=True,
+            broadcast_buffers=False,
         )
     optimizer = get_default_optimizer(model)
 
@@ -282,8 +294,16 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
     point_one_step = max(1, total_train_steps // 1000)
     five_percent_interval = max(1, total_train_steps // 20)
 
+    # 🔹 중단지점 재개 시 중복 학습 방지
+    remaining_optim_steps = total_steps - start_step
+    if remaining_optim_steps <= 0 and is_main():
+        print("✅ Already completed planned steps; skipping training.")
+        return
+
     num_epochs = 1
     optim_step = start_step
+    reached_budget = False  # 2중 루프 탈출용 플래그
+    
     for epoch in range(num_epochs):
         if is_dist and train_sampler is not None:
             train_sampler.set_epoch(epoch)
@@ -333,6 +353,11 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 optim_step += 1  # ✅ 옵티 스텝 증가
+                
+                # 🔹 총 스텝 도달 시 탈출
+                if optim_step >= total_steps:
+                    reached_budget = True
+                    break
 
                 # 🔹 LR 로깅은 옵티 스텝 기준
                 if writer and (optim_step % 50 == 0):
@@ -367,11 +392,19 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
                     main=main_loss.item(),
                     aux=aux_loss.item() if isinstance(aux_loss, torch.Tensor) else 0.0
                 )
+        
+        # 🔹 2중 루프 탈출 처리
+        if reached_budget:
+            if is_main():
+                print(f"✅ Reached training budget at step {optim_step}/{total_steps}")
+            break
 
     if progress_bar: progress_bar.close()
 
     if is_main():
         save_checkpoint(base_model, optimizer, scheduler, optim_step, best_loss, total_train_steps, save_dir, "last_checkpoint.safetensors")
     
+    # 🔹 종료 시 프로세스 정리
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
+        dist.destroy_process_group()
