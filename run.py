@@ -74,7 +74,8 @@ setup_nccl_env_safely()
 import argparse
 from config import HASH_TABLE_PATH
 from utils import set_current_input_ids, get_current_input_ids
-from train import train_moe, set_seed
+from train import train_moe
+from utils import set_seed
 from tools_hash import create_global_hash_table
 from analysis_expert_mapping import run_mapping_analysis
 
@@ -123,7 +124,7 @@ def main():
             run_confidence=True,
             run_routes=True,
         )
-    elif args.cmd in {"train", "eval"}:
+    elif args.cmd == "train":
         set_seed(42)
         train_moe(
             mode=args.mode,
@@ -131,8 +132,11 @@ def main():
             batch_size=args.batch_size,
             seq_len=args.seq_len,
             grad_accum=args.grad_accum,
-            continue_training=(args.cmd == "train" and args.continue_training),
+            continue_training=args.continue_training,
         )
+    elif args.cmd == "eval":
+        from test import run_all_tests
+        run_all_tests(batch_size=args.batch_size, base_num_experts=args.num_experts)
 
 if __name__ == "__main__":
     main()
@@ -140,7 +144,7 @@ if __name__ == "__main__":
 #python run.py train --mode stablemoe --num_experts 16 --batch_size 44 --seq_len 1024 --grad_accum 1
 #torchrun --nproc_per_node=2 --master_port=29600 run.py train --mode switch --num_experts 16 --batch_size 44 --seq_len 1024 --grad_accum 1
 
-#apt update && apt install -y nano zip unzip && pip install transformers datasets tensorboard pandas tqdm scipy tiktoken safetensors huggingface_hub hf_transfer
+#apt update && apt install -y nano zip unzip && pip install transformers datasets tensorboard pandas tqdm scipy tiktoken safetensors huggingface_hub hf_transfer calflops
 #tensorboard --logdir=/workspace/runs --host=0.0.0.0 --port=6006
 
 #wget https://github.com/schollz/croc/releases/download/v10.2.5/croc_v10.2.5_Linux-64bit.tar.gz

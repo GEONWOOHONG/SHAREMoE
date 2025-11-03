@@ -133,9 +133,17 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
     if is_main():
         print(f"💾 Checkpoint directory: {save_dir}")
 
-    eff_num_experts = num_experts * 4 if mode == "xmoe" else num_experts
-    if mode == "xmoe" and eff_num_experts != num_experts and is_main():
+    if mode == "xmoe":
+        eff_num_experts = num_experts * 4
+    elif mode in ("ours_com", "ours_refine"):
+        eff_num_experts = num_experts + 1
+    else:
+        eff_num_experts = num_experts
+
+    if mode == "xmoe" and eff_num_experts != num_experts:
         print(f"🧮 xmoe mode: num_experts overridden {num_experts} → {eff_num_experts} (×4)")
+    if mode in ("ours_com", "ours_refine"):
+        print(f"🧮 ours mode: globals={num_experts}, total_passed={eff_num_experts} (=globals+1 local)")
 
     freq_dict = None
     if mode == "hash":
@@ -254,7 +262,9 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
     from utils import print_model_info as _pmi
     if is_main():
         _pmi(model, config, mode, eff_num_experts, batch_size=batch_size, grad_accum_steps=grad_accum,
-             effective_batch=batch_size * (world_size if is_dist else 1) * grad_accum)
+            effective_batch=batch_size * (world_size if is_dist else 1) * grad_accum)
+        if mode in ("ours_com", "ours_refine"):
+            print(f"🔎 Experts: globals={num_experts}, local_per_layer=1, total_passed={eff_num_experts}")
 
     if is_main() and not os.path.exists(os.path.join(save_dir, "config.json")):
         config.loss_type = "ForCausalLMLoss"
