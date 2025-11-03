@@ -21,7 +21,7 @@ from patches import (
     patch_model_for_ours_com,
     patch_model_for_stablemoe,
 )
-from tools_hash import evaluate as eval_ppl_only, compute_moe_stats
+from train import evaluate as eval_ppl_only, compute_moe_stats
 from utils import ensure_flash_attn, set_seed
 
 CHECKPOINT_ROOT = "/workspace/checkpoints"

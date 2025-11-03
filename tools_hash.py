@@ -4,59 +4,6 @@ from collections import Counter
 from data import load_or_prepare_pile
 from modeling import HashRouter
 from config import HASH_TABLE_PATH
-import torch.nn.functional as F
-from contextlib import nullcontext
-import math
-
-@torch.no_grad()
-def evaluate(model, dataloader, device, show_bar=False, desc="eval", max_batches=None):
-    """
-    Returns: (avg_loss, perplexity)
-    """
-    model.eval()
-    total_nll = 0.0
-    total_tokens = 0
-    iterator = dataloader
-    if show_bar:
-        iterator = tqdm(dataloader, desc=desc, leave=False)
-    for i, batch in enumerate(iterator):
-        if max_batches is not None and i >= max_batches:
-            break
-        input_ids = batch["input_ids"].to(device, non_blocking=True)
-        attention_mask = batch.get("attention_mask")
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(device, non_blocking=True)
-
-        # shift for next-token prediction
-        logits = model(input_ids=input_ids, attention_mask=attention_mask).logits  # [B,T,V]
-        shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = input_ids[:, 1:].contiguous()
-        if attention_mask is not None:
-            shift_mask = attention_mask[:, 1:].contiguous().float()
-        else:
-            shift_mask = torch.ones_like(shift_labels, dtype=torch.float)
-
-        # flatten
-        vocab = shift_logits.size(-1)
-        loss = F.cross_entropy(
-            shift_logits.view(-1, vocab),
-            shift_labels.view(-1),
-            reduction="none"
-        ).view_as(shift_labels)
-
-        # mask paddings
-        loss = (loss * shift_mask)
-        n_tokens = torch.clamp_min(shift_mask.sum(), 1).item()
-        nll_sum = loss.sum().item()
-
-        total_nll += nll_sum
-        total_tokens += int(n_tokens)
-
-    if total_tokens == 0:
-        return float("nan"), float("nan")
-    avg_nll = total_nll / total_tokens
-    ppl = math.exp(avg_nll)
-    return avg_nll, ppl
 
 def create_global_hash_table(num_experts):
     if os.path.exists(HASH_TABLE_PATH):
