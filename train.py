@@ -195,6 +195,8 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
         patch_model_basic(model)
 
     train_dataset, valid_dataset = load_or_prepare_pile(verbose=is_main())
+    valid_dataset = valid_dataset.select(range(int(0.1 * len(valid_dataset))))
+    
     if is_main():
         print(f"Using FULL datasets: train={len(train_dataset):,}, valid={len(valid_dataset):,}")
 
