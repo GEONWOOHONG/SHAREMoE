@@ -661,16 +661,15 @@ def run_mapping_analysis(
         print(f"🐛 DEBUG 모드: 전체 {num_batches}개 배치 중 약 0.1%인 {limit_batches}개만 사용합니다.")
         max_batches = limit_batches
 
-    # === 모델 경로 ===
     potential_model_paths = {
-        "hash":       os.path.join(CHECKPOINTS_DIR, "hash_exp1", "best_checkpoint.safetensors.safetensors"),
-        "ours_com":   os.path.join(CHECKPOINTS_DIR, "ours_com_exp1", "best_checkpoint.safetensors.safetensors"),
-        "gshard":     os.path.join(CHECKPOINTS_DIR, "gshard_exp1", "best_checkpoint.safetensors.safetensors"),
-        "switch":     os.path.join(CHECKPOINTS_DIR, "switch_exp1", "best_checkpoint.safetensors.safetensors"),
-        "stablemoe":  os.path.join(CHECKPOINTS_DIR, "stablemoe_exp1", "best_checkpoint.safetensors.safetensors"),
-        "hypermoe":   os.path.join(CHECKPOINTS_DIR, "hypermoe_exp1", "best_checkpoint.safetensors.safetensors"),
-        "xmoe":       os.path.join(CHECKPOINTS_DIR, "xmoe_exp1", "best_checkpoint.safetensors.safetensors"),
-        "expert_choice": os.path.join(CHECKPOINTS_DIR, "expert_choice_exp1", "best_checkpoint.safetensors.safetensors"),
+        "hash":       os.path.join(CHECKPOINTS_DIR, "hash_exp1", "best_checkpoint.safetensors"),
+        "ours_com":   os.path.join(CHECKPOINTS_DIR, "ours_com_exp1", "best_checkpoint.safetensors"),
+        "gshard":     os.path.join(CHECKPOINTS_DIR, "gshard_exp1", "best_checkpoint.safetensors"),
+        "switch":     os.path.join(CHECKPOINTS_DIR, "switch_exp1", "best_checkpoint.safetensors"),
+        "stablemoe":  os.path.join(CHECKPOINTS_DIR, "stablemoe_exp1", "best_checkpoint.safetensors"),
+        "hypermoe":   os.path.join(CHECKPOINTS_DIR, "hypermoe_exp1", "best_checkpoint.safetensors"),
+        "xmoe":       os.path.join(CHECKPOINTS_DIR, "xmoe_exp1", "best_checkpoint.safetensors"),
+        "expert_choice": os.path.join(CHECKPOINTS_DIR, "expert_choice_exp1", "best_checkpoint.safetensors"),
     }
 
     available_model_paths = {

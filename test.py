@@ -25,7 +25,7 @@ from patches import (
 from train import evaluate as eval_ppl_only, compute_moe_stats
 from utils import ensure_flash_attn, set_seed
 
-CHECKPOINT_ROOT = "/workspace/checkpoints"
+CHECKPOINTS_DIR = "/workspace/checkpoints"
 HASH_TABLE_PATH = "/workspace/checkpoints/hash_exp1/global_hash_router_table.pt"
 
 def _replicate_ours_com_weights(model, f, checkpoint_keys, model_keys, loaded_keys):
@@ -247,7 +247,7 @@ def run_all_tests(batch_size=44, base_num_experts=16):
                              generator=get_dataloader_generator(0))
     candidate_modes = ["dense","switch","gshard","hash","stablemoe","xmoe","ours_com","ours_refine","hypermoe"]
     def pick_ckpt(mode):
-        d = os.path.join(CHECKPOINT_ROOT, f"{mode}_exp1")
+        d = os.path.join(CHECKPOINTS_DIR, f"{mode}_exp1")
         if not os.path.isdir(d):
             return None
         candidates = [
@@ -377,7 +377,7 @@ def run_all_tests(batch_size=44, base_num_experts=16):
                 torch.cuda.ipc_collect()
     if results:
         df = pd.DataFrame(results).T
-        out = os.path.join(CHECKPOINT_ROOT, "test_results_wt103_cc100_owt_pile.csv")
+        out = os.path.join(CHECKPOINTS_DIR, "test_results_wt103_cc100_owt_pile.csv")
         df.to_csv(out, index=True)
         print(f"\nSaved results to: {out}")
         print(df)
