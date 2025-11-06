@@ -1,9 +1,19 @@
+#run.py
 import os, subprocess, shutil, contextlib
 os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 os.environ.setdefault("HF_HUB_ENABLE_PROGRESS_BARS", "0")
 os.environ.setdefault("HF_DATASETS_VERBOSITY", "warning")
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("HF_HOME", "/workspace/hf_cache")
+os.environ.setdefault("HF_DATASETS_CACHE", "/workspace/hf_cache/datasets")
+os.makedirs(os.environ["HF_DATASETS_CACHE"], exist_ok=True)
+
+import argparse
+from train import train_moe
+from utils import set_seed
+from analysis_expert_mapping import run_mapping_analysis
 
 def _setenv_if_missing(k, v):
     if os.environ.get(k) in (None, ""):
@@ -63,21 +73,20 @@ def setup_nccl_env_safely(print_topology_rank0=True):
         print("================================================")
         print(f"[NCCL] has_nvlink={has_nvlink}, has_ib={has_ib}, has_gdr={has_gdr}")
 
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-os.environ.setdefault("HF_HOME", "/workspace/hf_cache")
-os.environ.setdefault("HF_DATASETS_CACHE", "/workspace/hf_cache/datasets")
-os.makedirs(os.environ["HF_DATASETS_CACHE"], exist_ok=True)
+def _maybe_set_expandable_segments():
+    try:
+        gnames = _read_cmd("nvidia-smi --query-gpu=name --format=csv,noheader").strip().splitlines()
+        gname0 = (gnames[0] if gnames else "").upper()
+        if ("A100" in gname0) or ("H100" in gname0):
+            os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+            return
+    except Exception:
+        pass
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+_maybe_set_expandable_segments()
 
 setup_nccl_env_safely()
-
-import argparse
-from config import HASH_TABLE_PATH
-from utils import set_current_input_ids, get_current_input_ids
-from train import train_moe
-from utils import set_seed
-from tools_hash import create_global_hash_table
-from analysis_expert_mapping import run_mapping_analysis
 
 def main():
     ap = argparse.ArgumentParser()
@@ -97,9 +106,6 @@ def main():
     ev.add_argument("--batch_size", type=int, default=44)
     ev.add_argument("--seq_len", type=int, default=1024)
     
-    bh = sub.add_parser("build-hash")
-    bh.add_argument("--num_experts", type=int, default=16)
-
     an = sub.add_parser("analysis")
     an.add_argument("--num_experts", type=int, default=16)
     an.add_argument("--batch_size", type=int, default=44)
@@ -108,9 +114,7 @@ def main():
 
     args = ap.parse_args()
 
-    if args.cmd == "build-hash":
-        create_global_hash_table(num_experts=args.num_experts)
-    elif args.cmd == "analysis":
+    if args.cmd == "analysis":
         set_seed(42)
         debug_max_batches = args.max_batches
         if args.debug and args.max_batches is None:
@@ -142,7 +146,7 @@ if __name__ == "__main__":
     main()
 
 #python run.py train --mode stablemoe --num_experts 16 --batch_size 44 --seq_len 1024 --grad_accum 1
-#torchrun --nproc_per_node=2 --master_port=29600 run.py train --mode switch --num_experts 16 --batch_size 44 --seq_len 1024 --grad_accum 1
+#torchrun --nproc_per_node=4 --master_port=29600 run.py train --mode ours_refine --num_experts 16 --batch_size 44 --seq_len 1024 --grad_accum 1
 #python run.py eval --batch_size 44 --num_experts 16
 
 #apt update && apt install -y nano zip unzip && pip install transformers datasets tensorboard pandas tqdm scipy tiktoken safetensors huggingface_hub hf_transfer calflops

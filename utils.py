@@ -1,11 +1,120 @@
+#utils.py
 import os, math, random, numpy as np, torch
 from safetensors.torch import save_model
 from transformers import get_cosine_schedule_with_warmup
 import torch.optim as optim
 import torch.nn.functional as F
+import re
+from safetensors.torch import safe_open
 
 def _is_rank0() -> bool:
     return os.environ.get("RANK", "0") == "0"
+
+@torch.no_grad()
+def load_safetensors(model, path: str, *, mode: str = "switch", strict: bool = True) -> None:
+    device_ctx = "cpu"
+    sd = model.state_dict()
+    mk = set(sd.keys())
+    loaded = []
+
+    with safe_open(path, framework="pt", device=device_ctx) as f:
+        ck = set(f.keys())
+
+        for k in ck:
+            if k in mk:
+                try:
+                    sd[k].copy_(f.get_tensor(k))
+                    loaded.append(k)
+                except Exception:
+                    pass
+
+        if mode in ("ours_com", "ours_refine"):
+            sr_src_layer = None
+            sr_pat = re.compile(r"^transformer\.h\.(\d+)\.mlp\.moe\.shared_router\.gru\.")
+            for k in ck:
+                m = sr_pat.match(k)
+                if m:
+                    sr_src_layer = int(m.group(1))
+                    break
+
+            if sr_src_layer is not None:
+                sr_src_prefix = f"transformer.h.{sr_src_layer}.mlp.moe.shared_router.gru."
+                sr_src_keys = [k for k in ck if k.startswith(sr_src_prefix)]
+
+                h_pat = re.compile(r"^transformer\.h\.(\d+)\.")
+                num_layers = 0
+                for mk_ in mk:
+                    m = h_pat.match(mk_)
+                    if m:
+                        num_layers = max(num_layers, int(m.group(1)) + 1)
+
+                copied = 0
+                for tgt in range(num_layers):
+                    if tgt == sr_src_layer:
+                        continue
+                    for src_k in sr_src_keys:
+                        tgt_k = src_k.replace(f".h.{sr_src_layer}.", f".h.{tgt}.")
+                        if tgt_k in mk:
+                            try:
+                                sd[tgt_k].copy_(f.get_tensor(src_k))
+                                loaded.append(tgt_k)
+                                copied += 1
+                            except Exception:
+                                pass
+                if _is_rank0():
+                    print(f"ours_com/refine: shared_router params replicated to all layers (copied={copied})")
+
+            ge_src_layer = None
+            ge_pat = re.compile(r"^transformer\.h\.(\d+)\.mlp\.moe\.global_experts\.\d+\.(w1|w2)\.weight$")
+            for k in ck:
+                m = ge_pat.match(k)
+                if m:
+                    ge_src_layer = int(m.group(1))
+                    break
+
+            if ge_src_layer is not None:
+                ge_src_prefix = f"transformer.h.{ge_src_layer}.mlp.moe.global_experts."
+                ge_src_keys = [k for k in ck if k.startswith(ge_src_prefix)]
+                h_pat = re.compile(r"^transformer\.h\.(\d+)\.")
+                num_layers = 0
+                for mk_ in mk:
+                    m = h_pat.match(mk_)
+                    if m:
+                        num_layers = max(num_layers, int(m.group(1)) + 1)
+
+                copied = 0
+                for tgt in range(num_layers):
+                    if tgt == ge_src_layer:
+                        continue
+                    for src_k in ge_src_keys:
+                        tgt_k = src_k.replace(f".h.{ge_src_layer}.", f".h.{tgt}.")
+                        if tgt_k in mk:
+                            try:
+                                sd[tgt_k].copy_(f.get_tensor(src_k))
+                                loaded.append(tgt_k)
+                                copied += 1
+                            except Exception:
+                                pass
+                if _is_rank0():
+                    print(f"ours_com/refine: global_experts params replicated to all layers (copied={copied})")
+
+        if "transformer.wte.weight" in mk and "transformer.wte.weight" not in loaded and "lm_head.weight" in ck:
+            if _is_rank0():
+                print("🔗 Tying: lm_head.weight -> transformer.wte.weight")
+            try:
+                sd["transformer.wte.weight"].copy_(f.get_tensor("lm_head.weight"))
+                loaded.append("transformer.wte.weight")
+            except Exception:
+                pass
+
+    missing = [k for k in mk if k not in loaded]
+    extra   = [k for k in ck if k not in mk]
+    if _is_rank0():
+        print(f"📦 Loaded {len(loaded)}/{len(mk)} tensors from checkpoint: {os.path.basename(path)}")
+        if missing and not strict:
+            print(f"… Missing {len(missing)} keys (kept random init)")
+        if extra and strict:
+            print(f"… Unexpected {len(extra)} keys in checkpoint (strict=True)")
 
 CURRENT_INPUT_IDS = None
 def set_current_input_ids(x):

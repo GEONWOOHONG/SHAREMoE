@@ -1,3 +1,4 @@
+#modeling.py
 import math, random, torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -5,8 +6,11 @@ from transformers import GPT2Config
 from typing import Optional
 from collections import Counter
 from torch.distributions.normal import Normal
-
+import os
 softplus = nn.Softplus()
+
+def _rank0():
+    return os.environ.get("RANK", "0") == "0"
 
 class HyperMoEShared(nn.Module):
     """Cross-layer shared hypernetwork bundle for HyperMoE."""
@@ -266,7 +270,9 @@ class XMoEThresholdRouter(nn.Module):
         R = torch.empty_like(R_sorted)
         R.scatter_(dim=1, index=idx_sorted, src=R_sorted)
         capacity = int(math.ceil(N / self.num_experts) * self.capacity_factor)
-        capacity = max(1, capacity)
+        if not self.training:
+            capacity = N
+        capacity = max(1, min(capacity, N))
         R_col_sorted_vals, R_col_sorted_tok = torch.sort(R, dim=0, descending=True)
         keep_flags = torch.zeros_like(R, dtype=torch.bool)
         C = min(capacity, N)
@@ -526,6 +532,8 @@ class MoELayer(nn.Module):
             x_flat = x.view(-1, h)
             out_flat = torch.zeros_like(x_flat)
             capacity = int(self.capacity_factor * math.ceil(x_flat.size(0) / self.num_experts))
+            if not self.training:
+                capacity = x_flat.size(0)
             for eid in range(self.num_experts):
                 idx = (top_idx == eid).nonzero(as_tuple=True)[0]
                 if idx.numel() > 0:
@@ -549,12 +557,14 @@ class MoELayer(nn.Module):
             x_flat = x.view(-1, h)
             out_flat = torch.zeros_like(x_flat)
             capacity = int(self.capacity_factor * math.ceil(x_flat.size(0) * 2 / self.num_experts))
+            if not self.training:
+                capacity = x_flat.size(0)
             for eid in range(self.num_experts):
                 for k in range(2):
                     idx = (top_idx[:, k] == eid).nonzero(as_tuple=True)[0]
                     if idx.numel() > 0:
                         score = top_scores[idx, k]
-                        if k == 1:
+                        if self.training and k == 1:
                             randmask = torch.rand_like(score)
                             mask = score * 2 > randmask
                             idx = idx[mask]
@@ -807,6 +817,8 @@ class MoELayer(nn.Module):
 
             top1_idx = affinities.argmax(dim=1)
             cap = int(math.ceil(N / self.num_experts) * self.capacity_factor)
+            if not self.training:
+                cap = N
             cap = max(1, min(cap, N))
 
             out_flat = x_flat.new_zeros(N, h)
@@ -1027,7 +1039,8 @@ def convert_gpt2_to_moe(
     stable_balance_alpha: float = 0.3,
 ):
     if mode == "dense":
-        print("🔹 Mode is 'dense', returning original GPT-2 model without MoE conversion.")
+        if _rank0():
+            print("🔹 Mode is 'dense', returning original GPT-2 model without MoE conversion.")
         return model
 
     shared_expert = None
@@ -1045,7 +1058,8 @@ def convert_gpt2_to_moe(
                 nn.Parameter(torch.empty(vocab_size, stable_routing_dim))
             )
             nn.init.normal_(model.stablemoe_routing_weight, mean=0.0, std=0.02)
-            print(f"🔹 StableMoE: Registered shared routing weight ({vocab_size}, {stable_routing_dim})")
+            if _rank0():
+                print(f"🔹 StableMoE: Registered shared routing weight ({vocab_size}, {stable_routing_dim})")
 
         if not hasattr(model, "stablemoe_distill_E"):
             model.register_parameter(
@@ -1053,7 +1067,8 @@ def convert_gpt2_to_moe(
                 nn.Parameter(torch.empty(eff_num_experts, stable_routing_dim))
             )
             nn.init.orthogonal_(model.stablemoe_distill_E, gain=0.1)
-            print(f"🔹 StableMoE: Registered shared distilled centroids ({eff_num_experts}, {stable_routing_dim})")
+            if _rank0():
+                print(f"🔹 StableMoE: Registered shared distilled centroids ({eff_num_experts}, {stable_routing_dim})")
 
     if mode == "ours_com":
         assert num_experts >= 2, "ours_com requires at least 2 experts (1 local + N global)."
@@ -1078,7 +1093,8 @@ def convert_gpt2_to_moe(
             scale = 1.0 / max(1e-6, float(xmoe_expert_mult))
             xmoe_capacity_factor = float(capacity_factor) * scale
         xmoe_capacity_factor = float(max(0.5, min(xmoe_capacity_factor, 8.0)))
-        print(f"🧮 XMoE γ auto-scale: base_cf={capacity_factor:.2f}, mult={xmoe_expert_mult:.2f} ⇒ γ={xmoe_capacity_factor:.2f}")
+        if _rank0():
+            print(f"🧮 XMoE γ auto-scale: base_cf={capacity_factor:.2f}, mult={xmoe_expert_mult:.2f} ⇒ γ={xmoe_capacity_factor:.2f}")
 
     hypermoe_shared_pack = None
     if mode == "hypermoe":

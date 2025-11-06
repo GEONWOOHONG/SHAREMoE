@@ -1,3 +1,4 @@
+#test.py
 import os
 from config import HF_HOME, HF_DATASETS_CACHE
 os.environ.setdefault("HF_HOME", HF_HOME)
@@ -5,7 +6,7 @@ os.environ.setdefault("HF_DATASETS_CACHE", HF_DATASETS_CACHE)
 
 from transformers.models.gpt2.modeling_gpt2 import GPT2Block as _GPT2Block
 _ORIG_GPT2BLOCK_FORWARD = _GPT2Block.forward
-import time, re, numpy as np, torch
+import time, numpy as np, torch
 
 from torch.utils.data import DataLoader
 from transformers import GPT2Config, GPT2LMHeadModel
@@ -15,7 +16,7 @@ import pandas as pd
 from contextlib import nullcontext
 
 from data import load_or_prepare_pile, worker_init_fn, get_dataloader_generator
-from modeling import convert_gpt2_to_moe, GPT2LayerMoE
+from modeling import convert_gpt2_to_moe
 from patches import (
     patch_model_basic,
     patch_model_for_hash_moe,
@@ -23,84 +24,10 @@ from patches import (
     patch_model_for_stablemoe,
 )
 from train import evaluate as eval_ppl_only, compute_moe_stats
-from utils import ensure_flash_attn, set_seed
+from utils import ensure_flash_attn, set_seed, load_safetensors
 
-CHECKPOINTS_DIR = "/workspace/checkpoints"
-HASH_TABLE_PATH = "/workspace/checkpoints/hash_exp1/global_hash_router_table.pt"
-
-def _replicate_ours_com_weights(model, f, checkpoint_keys, model_keys, loaded_keys):
-    sr_src_layer = None
-    sr_pat = re.compile(r"transformer\.h\.(\d+)\.mlp\.moe\.shared_router\.gru\.weight_ih")
-    for k in checkpoint_keys:
-        m = sr_pat.match(k)
-        if m:
-            sr_src_layer = int(m.group(1)); break
-    if sr_src_layer is not None:
-        sr_src_prefix = f"transformer.h.{sr_src_layer}.mlp.moe.shared_router.gru."
-        sr_src_keys = [k for k in checkpoint_keys if k.startswith(sr_src_prefix)]
-        h_pat = re.compile(r"transformer\.h\.(\d+)\.")
-        num_layers = 0
-        for mk in model_keys:
-            m = h_pat.match(mk)
-            if m: num_layers = max(num_layers, int(m.group(1)) + 1)
-        copied = 0
-        for tgt in range(num_layers):
-            if tgt == sr_src_layer: continue
-            for src_k in sr_src_keys:
-                tgt_k = src_k.replace(f".h.{sr_src_layer}.", f".h.{tgt}.")
-                if tgt_k in model_keys:
-                    try:
-                        model.state_dict()[tgt_k].copy_(f.get_tensor(src_k))
-                        loaded_keys.append(tgt_k); copied += 1
-                    except Exception: pass
-        print(f"ours_com: shared_router params replicated to all layers (copied={copied})")
-    ge_src_layer = None
-    ge_pat = re.compile(r"transformer\.h\.(\d+)\.mlp\.moe\.global_experts\.0\.w1\.weight")
-    for k in checkpoint_keys:
-        m = ge_pat.match(k)
-        if m:
-            ge_src_layer = int(m.group(1)); break
-    if ge_src_layer is not None:
-        ge_src_prefix = f"transformer.h.{ge_src_layer}.mlp.moe.global_experts."
-        ge_src_keys = [k for k in checkpoint_keys if k.startswith(ge_src_prefix)]
-        h_pat = re.compile(r"transformer\.h\.(\d+)\.")
-        num_layers = 0
-        for mk in model_keys:
-            m = h_pat.match(mk)
-            if m: num_layers = max(num_layers, int(m.group(1)) + 1)
-        copied = 0
-        for tgt in range(num_layers):
-            if tgt == ge_src_layer: continue
-            for src_k in ge_src_keys:
-                tgt_k = src_k.replace(f".h.{ge_src_layer}.", f".h.{tgt}.")
-                if tgt_k in model_keys:
-                    try:
-                        model.state_dict()[tgt_k].copy_(f.get_tensor(src_k))
-                        loaded_keys.append(tgt_k); copied += 1
-                    except Exception: pass
-        print(f"ours_com: global_experts params replicated to all layers (copied={copied})")
-
-def load_model_from_safetensors(model, path, strict=True, mode="switch"):
-    from safetensors.torch import safe_open
-    with safe_open(path, framework="pt", device="cpu") as f:
-        ck = set(f.keys()); mk = set(model.state_dict().keys())
-        loaded = []
-        for k in ck:
-            if k in mk:
-                model.state_dict()[k].copy_(f.get_tensor(k)); loaded.append(k)
-        if mode in ("ours_com", "ours_refine"):
-            _replicate_ours_com_weights(model, f, ck, mk, loaded)
-        if "transformer.wte.weight" in mk and "transformer.wte.weight" not in loaded and "lm_head.weight" in ck:
-            print("Tying: lm_head.weight -> transformer.wte.weight")
-            model.state_dict()["transformer.wte.weight"].copy_(f.get_tensor("lm_head.weight"))
-            loaded.append("transformer.wte.weight")
-        missing = [k for k in mk if k not in loaded]
-        extra = [k for k in ck if k not in mk]
-        print(f"Loaded {len(loaded)}/{len(mk)} tensors from checkpoint")
-        if missing and not strict:
-            print(f"Missing {len(missing)} keys (kept random init)")
-        if extra and strict:
-            print(f"Unexpected {len(extra)} keys in checkpoint (strict=True)")
+from config import CHECKPOINTS_DIR, HASH_TABLE_PATH
+from tools_hash import create_global_hash_table
 
 def load_or_prepare_wt103():
     cache_dir = os.environ.get("HF_DATASETS_CACHE", None)
@@ -211,7 +138,8 @@ def measure_decode_throughput(model, prompt_ids, gen_len=50, dtype=torch.bfloat1
 
 def run_all_tests(batch_size=44, base_num_experts=16):
     set_seed(42)
-    ensure_flash_attn()
+    if torch.cuda.is_available():
+        ensure_flash_attn()
     _, pile_valid = load_or_prepare_pile(verbose=True)
     pile_valid.set_format(type="torch", columns=["input_ids", "attention_mask"])
     pile_valid = pile_valid.select(range(int(0.1 * len(pile_valid))))
@@ -295,6 +223,11 @@ def run_all_tests(batch_size=44, base_num_experts=16):
                     eff_num_experts = base_num_experts * 4
                 else:
                     eff_num_experts = base_num_experts
+
+                if mode == "hash" and not os.path.exists(HASH_TABLE_PATH):
+                    print(f"⚠️  Hash table not found at {HASH_TABLE_PATH}. Auto-building now for eval...")
+                    create_global_hash_table(base_num_experts)
+
                 extra = {}
                 if mode == "hash":
                     extra["freq_dict"] = {"__load_from_file__": HASH_TABLE_PATH}
@@ -304,6 +237,7 @@ def run_all_tests(batch_size=44, base_num_experts=16):
                     model, config, mode=mode,
                     num_experts=eff_num_experts, alpha=0.01, **extra
                 )
+
             if mode == "hash":
                 patch_model_for_hash_moe(model)
             elif mode in ("ours_com", "ours_refine"):
@@ -312,13 +246,12 @@ def run_all_tests(batch_size=44, base_num_experts=16):
                 patch_model_for_stablemoe(model)
             elif mode != "dense":
                 patch_model_basic(model)
+
             strict_flag = (mode not in ("ours_com", "ours_refine"))
-            load_model_from_safetensors(model, ckpt_path, strict=strict_flag, mode=mode)
+            load_safetensors(model, ckpt_path, mode=mode, strict=strict_flag)
+
             model.to(device)
-            try:
-                model.lm_head.weight = model.transformer.wte.weight
-            except Exception:
-                pass
+            model.lm_head.weight = model.transformer.wte.weight
             total_params = sum(p.numel() for p in model.parameters())
             per["Total Params"] = total_params
 

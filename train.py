@@ -1,3 +1,4 @@
+#train.py
 import os, math, torch, tiktoken, shutil, contextlib
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -14,6 +15,7 @@ from patches import (
     patch_model_for_hash_moe,
     patch_model_for_ours_com,
     patch_model_for_stablemoe,
+    patch_model_for_ours_refine,
 )
 
 from utils import (
@@ -22,6 +24,9 @@ from utils import (
     chunked_cross_entropy,
     enable_sdp_backends, prefer_flash_attention, print_attn_stack_status,
 )
+
+from config import HASH_TABLE_PATH
+from tools_hash import create_global_hash_table
 
 from torch.utils.tensorboard import SummaryWriter
 
@@ -141,15 +146,20 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
     else:
         eff_num_experts = num_experts
 
-    if mode == "xmoe" and eff_num_experts != num_experts:
-        print(f"🧮 xmoe mode: num_experts overridden {num_experts} → {eff_num_experts} (×4)")
-    if mode in ("ours_com", "ours_refine"):
-        print(f"🧮 ours mode: globals={num_experts}, total_passed={eff_num_experts} (=globals+1 local)")
+    if is_main():
+        if mode == "xmoe" and eff_num_experts != num_experts:
+            print(f"🧮 xmoe mode: num_experts overridden {num_experts} → {eff_num_experts} (×4)")
+        if mode in ("ours_com", "ours_refine"):
+            print(f"🧮 ours mode: globals={num_experts}, total_passed={eff_num_experts} (=globals+1 local)")
 
     freq_dict = None
     if mode == "hash":
         if not os.path.exists(HASH_TABLE_PATH):
-            raise FileNotFoundError(f"Hash table not found at {HASH_TABLE_PATH}\nPlease run `create_global_hash_table()` first.")
+            if is_main():
+                print(f"⚠️  Hash table not found at {HASH_TABLE_PATH}. Auto-building now...")
+                create_global_hash_table(num_experts)
+            if is_dist:
+                dist.barrier()
         if is_main():
             print(f"🔹 Loading global hash table from: {HASH_TABLE_PATH}")
         freq_dict = {'__load_from_file__': HASH_TABLE_PATH}
@@ -191,7 +201,7 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
     elif mode == "ours_com":
         patch_model_for_ours_com(model)
     elif mode == "ours_refine":
-        patch_model_for_ours_com(model)
+        patch_model_for_ours_refine(model)
     else:
         patch_model_basic(model)
 

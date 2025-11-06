@@ -1,7 +1,14 @@
+#patches.py
 import os, torch, types
 from transformers.models.gpt2.modeling_gpt2 import GPT2Block
 from transformers import GPT2LMHeadModel
 from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
+
+def patch_model_for_ours_refine(model):
+    rank = int(os.environ.get("RANK", "0"))
+    if rank == 0:
+        print("🔹 Applying ours_refine (Progressive Routing) forward patches...")
+    return patch_model_for_ours_com(model)
 
 def create_causal_mask(config, input_embeds, attention_mask=None,
                        cache_position=None, past_key_values=None, position_ids=None):

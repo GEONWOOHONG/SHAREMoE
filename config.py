@@ -1,3 +1,4 @@
+#config.py
 HASH_TABLE_PATH = "/workspace/checkpoints/hash_exp1/global_hash_router_table.pt"
 
 HF_HOME = "/workspace/hf_cache"

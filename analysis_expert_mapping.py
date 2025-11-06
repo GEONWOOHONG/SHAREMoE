@@ -3,20 +3,15 @@ import math
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from datasets import load_from_disk
 from transformers import GPT2Config, GPT2LMHeadModel
 import pandas as pd
 import numpy as np
 from collections import Counter, defaultdict
 from tqdm import tqdm
 import tiktoken
-from safetensors.torch import safe_open
-import types
-import random
-import sys
 import warnings
 from scipy.stats import entropy as shannon_entropy
-from transformers.models.gpt2.modeling_gpt2 import GPT2Attention
+from config import HF_DATASETS_CACHE, HASH_TABLE_PATH, CHECKPOINTS_DIR
 
 from modeling import (
     convert_gpt2_to_moe,
@@ -32,6 +27,8 @@ from patches import (
     patch_model_for_ours_com,
     block_moe_forward_patch,
 )
+
+from utils import set_seed, load_safetensors
 
 warnings.filterwarnings("ignore")
 
@@ -105,125 +102,11 @@ def _selected_set_metrics_from_scores(scores: torch.Tensor, k: int):
         "top1_idx_cpu": topk_idx[:, 0].detach().int().cpu().numpy()
     }
 
-# =====================
-# 환경 / 경로 설정
-# =====================
-from config import HF_DATASETS_CACHE, HASH_TABLE_PATH, CHECKPOINTS_DIR
 
 enc = tiktoken.get_encoding("gpt2")
 
-
-def set_seed(seed=42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = False
-    torch.backends.cudnn.benchmark = True
-
-
 set_seed(42)
 
-
-# =====================
-# 체크포인트 로딩
-# =====================
-def load_model(model, path, strict=True, mode="switch"):
-    """
-    체크포인트에서 모델 가중치 로드 + ours_com일 때 global_experts/GRU를 레이어 전역으로 복사.
-    lm_head -> wte weight-tying까지 복구.
-    """
-    import re
-    from safetensors.torch import safe_open
-
-    with safe_open(path, framework="pt", device="cpu") as f:
-        state = model.state_dict()
-        model_keys = set(state.keys())
-        ckpt_keys = set(f.keys())
-
-        loaded = set()
-        # 1) 일치하는 키는 그대로 로드
-        for k in ckpt_keys:
-            if k in model_keys:
-                state[k].copy_(f.get_tensor(k))
-                loaded.add(k)
-
-        # 2) 임베딩 호환 로드(있을 때만) — lm_head.weight를 wte로 복사
-        if 'transformer.wte.weight' in model_keys and 'transformer.wte.weight' not in loaded:
-            if 'lm_head.weight' in ckpt_keys:
-                print("🔄 Copying lm_head.weight to transformer.wte.weight (weight tying)...")
-                state['transformer.wte.weight'].copy_(f.get_tensor('lm_head.weight'))
-                loaded.add('transformer.wte.weight')
-                print("✅ Weight tying restored!")
-
-        # -------- ours_com: 레이어 확장 복사 --------
-        if mode == "ours_com":
-            n_layers = len(model.transformer.h)
-
-            # (a) global_experts의 "소스 레이어" 찾기
-            ge_pat = re.compile(r"^transformer\.h\.(\d+)\.mlp\.moe\.global_experts\.(\d+)\.(w1|w2)\.weight$")
-            ge_src_layer = None
-            ge_eids = set()
-            for k in ckpt_keys:
-                m = ge_pat.match(k)
-                if m:
-                    ge_src_layer = int(m.group(1))
-                    ge_eids.add(int(m.group(2)))
-
-            # (b) shared_router(GRU)의 "소스 레이어" 찾기
-            sr_pat = re.compile(r"^transformer\.h\.(\d+)\.mlp\.moe\.shared_router\.gru\.(.+)$")
-            sr_src_layer = None
-            sr_keys_suffix = set()
-            for k in ckpt_keys:
-                m = sr_pat.match(k)
-                if m:
-                    sr_src_layer = int(m.group(1))
-                    sr_keys_suffix.add(m.group(2))  # ex) weight_ih, weight_hh, bias_ih, bias_hh
-
-            # (c) global_experts 복사
-            if ge_src_layer is not None and ge_eids:
-                print(f"🔄 Replicating global_experts (from layer {ge_src_layer}) to all layers...")
-                for l in range(n_layers):
-                    for e in ge_eids:
-                        for wname in ("w1.weight", "w2.weight"):
-                            tgt = f"transformer.h.{l}.mlp.moe.global_experts.{e}.{wname}"
-                            if tgt in model_keys and tgt not in loaded:
-                                src = f"transformer.h.{ge_src_layer}.mlp.moe.global_experts.{e}.{wname}"
-                                if src in ckpt_keys:
-                                    state[tgt].copy_(f.get_tensor(src))
-                                    loaded.add(tgt)
-
-            # (d) shared_router(GRU) 복사
-            if sr_src_layer is not None and sr_keys_suffix:
-                print(f"🔄 Replicating shared_router(GRU) (from layer {sr_src_layer}) to all layers...")
-                for l in range(n_layers):
-                    for suf in sr_keys_suffix:
-                        tgt = f"transformer.h.{l}.mlp.moe.shared_router.gru.{suf}"
-                        if tgt in model_keys and tgt not in loaded:
-                            src = f"transformer.h.{sr_src_layer}.mlp.moe.shared_router.gru.{suf}"
-                            if src in ckpt_keys:
-                                state[tgt].copy_(f.get_tensor(src))
-                                loaded.add(tgt)
-
-        # 3) 리포트
-        missing = sorted(k for k in model_keys if k not in loaded)
-        unexpected = sorted(k for k in ckpt_keys if k not in model_keys)
-
-        print(f"✅ Loaded {len(loaded)}/{len(model_keys)} tensors from checkpoint")
-        if missing:
-            print(f"⚠️ Missing keys: {len(missing)} (showing 0)")
-        if unexpected:
-            print(f"⚠️ Unexpected keys in ckpt: {len(unexpected)} (showing 0)")
-
-        if strict:
-            if missing:
-                raise RuntimeError(f"Missing keys in strict mode: {missing[:10]}")
-            if unexpected:
-                raise RuntimeError(f"Unexpected keys in strict mode: {unexpected[:10]}")
-
-# =====================
-# Pile 데이터셋 로딩
-# =====================
 def load_pile_validation_dataset():
     """Pile validation 데이터셋 로드 (HF 허브에서 캐시 사용)"""
     from data import load_or_prepare_pile
@@ -734,7 +617,6 @@ def run_mapping_analysis(
                 freq_dict=freq_dict
             )
 
-        # 패치
         if mode == "hash":
             patch_model_for_hash_moe(model)
         elif mode == "ours_com":
@@ -742,29 +624,25 @@ def run_mapping_analysis(
         elif mode != "dense":
             patch_model_basic(model)
 
-        # ours_com: shared_router 객체 공유
         if mode == "ours_com":
             root_router = model.transformer.h[0].mlp.moe.shared_router
             for l in range(1, config.n_layer):
                 model.transformer.h[l].mlp.moe.shared_router = root_router
 
-        # 체크포인트 로드
         try:
-            load_model(model, ckpt_path, strict=False, mode=mode)
+            load_safetensors(model, ckpt_path, mode=mode, strict=False)
         except Exception as e:
             print(f"❌ Failed to load {mode}: {e}")
             continue
 
         model.to(device)
 
-        # 🔒 GPU 이동 후 weight tying 재확인/복구
         model.lm_head.weight = model.transformer.wte.weight
         if not torch.equal(model.transformer.wte.weight.data, model.lm_head.weight.data):
             print("⚠️ Weight tying broken after GPU move, restoring...")
             model.transformer.wte.weight = model.lm_head.weight
             print("✅ Weight tying restored after GPU move!")
 
-        # 분석 실행
         (spec_list, conf_list, hist_list, route_sum, route_det,
             smooth_rows, mi_rows, calib_rows, lb_rows) = analyze_expert_specialization(
                 model=model,
@@ -775,7 +653,7 @@ def run_mapping_analysis(
                 max_batches=max_batches,
                 run_specialization=run_specialization,
                 run_confidence=run_confidence,
-                run_routes=run_routes,   # ← 여기!
+                run_routes=run_routes,
             )
 
         if run_specialization:
@@ -796,7 +674,6 @@ def run_mapping_analysis(
             df_histogram['Model'] = mode
             all_histogram_results.append(df_histogram)
 
-        # route 데이터 수집
         if route_sum:
             all_route_summary.extend(route_sum)
         if route_det:
@@ -814,16 +691,13 @@ def run_mapping_analysis(
             print(f"   🎯 Confidence: {len(df_confidence)} layers analyzed, "
                   f"avg entropy {df_confidence['Entropy_Load'].mean():.3f}")
 
-        # 메모리 정리
         del model
         torch.cuda.empty_cache()
 
-    # === 결과 저장 ===
     if all_specialization_results or all_confidence_results:
         output_dir = CHECKPOINTS_DIR
         os.makedirs(output_dir, exist_ok=True)
 
-        # 1) Specialization CSV
         if run_specialization and all_specialization_results:
             combined_specialization_df = pd.concat(all_specialization_results, ignore_index=True)
 
@@ -864,7 +738,6 @@ def run_mapping_analysis(
                 how='left'
             )
 
-            # 엔트로피(소스 집중도)
             print("\n🔬 Calculating Source Entropy for each expert...")
             expert_source_distribution = combined_specialization_df.groupby(
                 ['Model', 'Layer', 'Expert_ID']
@@ -919,7 +792,6 @@ def run_mapping_analysis(
         elif run_specialization:
             print("\n⚠️ Specialization analysis failed or no data collected.")
 
-        # 2) Confidence CSV
         if run_confidence and all_confidence_results:
             combined_confidence_df = pd.concat(all_confidence_results, ignore_index=True)
             confidence_output_path = os.path.join(output_dir, "routing_confidence_analysis.csv")
@@ -932,7 +804,6 @@ def run_mapping_analysis(
 
             print(f"Total records: {len(combined_confidence_df)}")
 
-            # 요약
             print(f"\n🎯 Routing Confidence Statistics by Model:")
             print(f"\n{'Model':<20} {'Entropy_Load':>12} {'Avg_C':>10} {'Avg_D':>10} {'Avg_Hsel':>10} {'Avg_EEC':>10} {'Avg_S1':>10}")
             print("-" * 80)
@@ -954,7 +825,6 @@ def run_mapping_analysis(
             print("  • Avg_EEC: 평균 Effective Expert Count")
             print("  • Avg_S1: 평균 Top-1 점유율 (선택집합 내)")
 
-        # 3) Confidence Histogram
         if run_confidence and all_histogram_results:
             combined_histogram_df = pd.concat(all_histogram_results, ignore_index=True)
             histogram_output_path = os.path.join(output_dir, "routing_confidence_histogram.csv")
@@ -971,25 +841,22 @@ def run_mapping_analysis(
         elif run_confidence:
             print("\n⚠️ Confidence histogram analysis failed or no data collected.")
 
-        # 4) Route 시퀀스 CSV 저장 (루프 끝난 후 한 번만)
         if all_route_detail:
             pd.DataFrame(all_route_detail).to_csv(
                 os.path.join(output_dir, "route_sequences_detail.csv"), index=False
             )
-            print(f"\n✅ Route sequence details saved to /workspace/checkpoints/route_sequences_detail.csv")
+            print(f"\n✅ Route sequence details saved to {os.path.join(output_dir, 'route_sequences_detail.csv')}")
 
         if all_route_summary:
             df_rs = pd.DataFrame(all_route_summary)
             df_rs.to_csv(os.path.join(output_dir, "route_sequences_summary.csv"), index=False)
-            print(f"✅ Route sequence summary saved to /workspace/checkpoints/route_sequences_summary.csv")
+            print(f"✅ Route sequence summary saved to {os.path.join(output_dir, 'route_sequences_summary.csv')}")
 
-            # 콘솔 하이라이트
             disp = (df_rs.sort_values(["RouteConsistency_ModalShare"], ascending=False)
                         .groupby("Model").head(5))
             print("\n🏁 Route Consistency (top domains by modal share):")
             print(disp.to_string(index=False))
 
-        # ==== NEW: Save 4 fairness-safe metrics ====
         if all_smoothness:
             pd.DataFrame(all_smoothness).to_csv(
                 os.path.join(output_dir, "route_smoothness.csv"), index=False
@@ -1020,9 +887,6 @@ def run_mapping_analysis(
 
 
 if __name__ == "__main__":
-    # =========================================================
-    # 모든 분석을 한 번에 실행
-    # =========================================================
     BASE_EXPERTS_COUNT = 16
     EVAL_BATCH_SIZE = 44
 
