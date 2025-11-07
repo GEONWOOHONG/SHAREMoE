@@ -752,8 +752,8 @@ class MoELayer(nn.Module):
 
             probe = self._ddp_probe_loss(dtype=x.dtype, device=x.device, alpha=getattr(self, "ddp_probe_alpha", 1e-8))
             balance_loss = probe
-
-            return routed_out, None, updated_routing_state
+            
+            return routed_out, balance_loss, updated_routing_state
 
         elif self.mode == "xmoe":
             final_mask, scores_sel, aux_loss, top1_idx = self.xmoe_router(x)
