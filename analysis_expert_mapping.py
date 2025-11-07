@@ -545,6 +545,7 @@ def run_mapping_analysis(
         max_batches = limit_batches
 
     potential_model_paths = {
+        "ours_refine": os.path.join(CHECKPOINTS_DIR, "ours_refine_exp1", "best_checkpoint.safetensors"),
         "hash":       os.path.join(CHECKPOINTS_DIR, "hash_exp1", "best_checkpoint.safetensors"),
         "ours_com":   os.path.join(CHECKPOINTS_DIR, "ours_com_exp1", "best_checkpoint.safetensors"),
         "gshard":     os.path.join(CHECKPOINTS_DIR, "gshard_exp1", "best_checkpoint.safetensors"),

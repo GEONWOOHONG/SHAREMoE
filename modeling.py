@@ -247,42 +247,55 @@ class XMoEThresholdRouter(nn.Module):
         self.gate = nn.Linear(d_model, num_experts, bias=False)
         nn.init.kaiming_uniform_(self.gate.weight, a=math.sqrt(5))
         self.last_scores = None
+
     def forward(self, x):
         B, T, H = x.shape
         N = B * T
         x_flat = x.view(N, H)
+
         logits = self.gate(x_flat)
         probs = F.softmax(logits, dim=-1)
         self.last_scores = probs.detach()
+
         p_sorted, idx_sorted = torch.sort(probs, dim=-1, descending=True)
         csum = torch.cumsum(p_sorted, dim=-1)
         reached = (csum >= self.threshold)
         reached[:, -1] = True
         k_idx = reached.float().argmax(dim=-1)
+
         arangeE = torch.arange(probs.size(1), device=probs.device).view(1, -1)
-        select_prefix = arangeE <= k_idx.view(-1, 1)
-        assign_sorted = select_prefix
-        assign_mask = torch.zeros_like(assign_sorted, dtype=torch.bool)
-        assign_mask.scatter_(dim=1, index=idx_sorted, src=assign_sorted)
-        rank_sorted = torch.arange(1, self.num_experts + 1, device=probs.device).view(1, -1).expand_as(p_sorted)
-        R_sorted = p_sorted - rank_sorted.float()
-        R_sorted = torch.where(assign_sorted, R_sorted, torch.full_like(R_sorted, -1e9))
-        R = torch.empty_like(R_sorted)
-        R.scatter_(dim=1, index=idx_sorted, src=R_sorted)
-        capacity = int(math.ceil(N / self.num_experts) * self.capacity_factor)
+        select_prefix = arangeE <= k_idx.view(-1, 1)  # [N, E] bool
+
+        assign_mask = torch.zeros_like(select_prefix, dtype=torch.bool)
+        assign_mask.scatter_(dim=1, index=idx_sorted, src=select_prefix)
+
         if not self.training:
-            capacity = N
-        capacity = max(1, min(capacity, N))
-        R_col_sorted_vals, R_col_sorted_tok = torch.sort(R, dim=0, descending=True)
-        keep_flags = torch.zeros_like(R, dtype=torch.bool)
-        C = min(capacity, N)
-        if C > 0:
-            topC_tok = R_col_sorted_tok[:C, :]
-            row_idx = topC_tok
-            col_idx = torch.arange(self.num_experts, device=probs.device).view(1, -1).expand_as(topC_tok)
-            keep_flags[row_idx, col_idx] = True
-        final_mask = assign_mask & keep_flags
+            final_mask = assign_mask
+        else:
+            rank_sorted = torch.arange(1, self.num_experts + 1, device=probs.device).view(1, -1).expand_as(p_sorted)
+            R_sorted = p_sorted - rank_sorted.float()
+            R_sorted = torch.where(select_prefix, R_sorted, torch.full_like(R_sorted, -1e9))
+            R = torch.empty_like(R_sorted)
+            R.scatter_(dim=1, index=idx_sorted, src=R_sorted)
+
+            capacity = int(math.ceil(N / self.num_experts) * self.capacity_factor)
+            capacity = max(1, min(capacity, N))
+
+            R_col_sorted_vals, R_col_sorted_tok = torch.sort(R, dim=0, descending=True)
+            keep_flags = torch.zeros_like(R, dtype=torch.bool)
+            C = min(capacity, N)
+            if C > 0:
+                topC_tok = R_col_sorted_tok[:C, :]
+                row_idx = topC_tok
+                col_idx = torch.arange(self.num_experts, device=probs.device).view(1, -1).expand_as(topC_tok)
+                keep_flags[row_idx, col_idx] = True
+
+            final_mask = assign_mask & keep_flags
+
         scores_sel = torch.where(final_mask, probs, torch.zeros_like(probs))
+        sel_sum = scores_sel.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+        scores_sel = scores_sel / sel_sum
+
         top1_scores, top1_idx = probs.max(dim=-1)
         one_hot = F.one_hot(top1_idx, num_classes=self.num_experts).float()
         fi = one_hot.mean(dim=0)
@@ -290,6 +303,7 @@ class XMoEThresholdRouter(nn.Module):
         pi.index_add_(0, top1_idx, top1_scores)
         pi = pi / float(N)
         aux_loss = self.num_experts * (fi * pi).sum() * self.alpha
+
         return final_mask, scores_sel, aux_loss, top1_idx
 
 class Router(nn.Module):
