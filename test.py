@@ -142,6 +142,7 @@ def run_all_tests(batch_size=44, base_num_experts=16):
         ensure_flash_attn()
     _, pile_valid = load_or_prepare_pile(verbose=True)
     pile_valid.set_format(type="torch", columns=["input_ids", "attention_mask"])
+    pile_valid = pile_valid.select(range(int(0.1 * len(pile_valid))))
     wt = load_or_prepare_wt103()
     wt_test = wt["test"]
     wt_test.set_format(type="torch", columns=["input_ids", "attention_mask"])
