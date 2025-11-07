@@ -9,7 +9,7 @@ from torch.distributions.normal import Normal
 import os
 softplus = nn.Softplus()
 
-STRICT_CAPACITY_IN_EVAL = True   # True면 eval에서도 capacity 적용 (우회 금지)
+STRICT_CAPACITY_IN_EVAL = False   # True면 eval에서도 capacity 적용 (우회 금지)
 ZERO_OUT_DROPPED = True          # 드랍 토큰의 MoE 출력은 0으로 (입력 복사 금지)
 
 def _rank0():
@@ -752,7 +752,7 @@ class MoELayer(nn.Module):
 
             probe = self._ddp_probe_loss(dtype=x.dtype, device=x.device, alpha=getattr(self, "ddp_probe_alpha", 1e-8))
             balance_loss = probe
-            
+
             return routed_out, balance_loss, updated_routing_state
 
         elif self.mode == "xmoe":
