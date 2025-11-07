@@ -9,6 +9,9 @@ from torch.distributions.normal import Normal
 import os
 softplus = nn.Softplus()
 
+STRICT_CAPACITY_IN_EVAL = True   # True면 eval에서도 capacity 적용 (우회 금지)
+ZERO_OUT_DROPPED = True          # 드랍 토큰의 MoE 출력은 0으로 (입력 복사 금지)
+
 def _rank0():
     return os.environ.get("RANK", "0") == "0"
 
@@ -269,18 +272,16 @@ class XMoEThresholdRouter(nn.Module):
         assign_mask = torch.zeros_like(select_prefix, dtype=torch.bool)
         assign_mask.scatter_(dim=1, index=idx_sorted, src=select_prefix)
 
-        if not self.training:
-            final_mask = assign_mask
+        if (not self.training) and (not STRICT_CAPACITY_IN_EVAL):
+             final_mask = assign_mask
         else:
             rank_sorted = torch.arange(1, self.num_experts + 1, device=probs.device).view(1, -1).expand_as(p_sorted)
             R_sorted = p_sorted - rank_sorted.float()
             R_sorted = torch.where(select_prefix, R_sorted, torch.full_like(R_sorted, -1e9))
             R = torch.empty_like(R_sorted)
             R.scatter_(dim=1, index=idx_sorted, src=R_sorted)
-
             capacity = int(math.ceil(N / self.num_experts) * self.capacity_factor)
             capacity = max(1, min(capacity, N))
-
             R_col_sorted_vals, R_col_sorted_tok = torch.sort(R, dim=0, descending=True)
             keep_flags = torch.zeros_like(R, dtype=torch.bool)
             C = min(capacity, N)
@@ -289,7 +290,6 @@ class XMoEThresholdRouter(nn.Module):
                 row_idx = topC_tok
                 col_idx = torch.arange(self.num_experts, device=probs.device).view(1, -1).expand_as(topC_tok)
                 keep_flags[row_idx, col_idx] = True
-
             final_mask = assign_mask & keep_flags
 
         scores_sel = torch.where(final_mask, probs, torch.zeros_like(probs))
@@ -546,7 +546,7 @@ class MoELayer(nn.Module):
             x_flat = x.view(-1, h)
             out_flat = torch.zeros_like(x_flat)
             capacity = int(self.capacity_factor * math.ceil(x_flat.size(0) / self.num_experts))
-            if not self.training:
+            if (not self.training) and (not STRICT_CAPACITY_IN_EVAL):
                 capacity = x_flat.size(0)
             for eid in range(self.num_experts):
                 idx = (top_idx == eid).nonzero(as_tuple=True)[0]
@@ -554,7 +554,10 @@ class MoELayer(nn.Module):
                     if idx.numel() > capacity:
                         keep = idx[:capacity]
                         dropped = idx[capacity:]
-                        out_flat[dropped] = x_flat[dropped]
+                        if ZERO_OUT_DROPPED:
+                            out_flat[dropped].zero_()
+                        else:
+                            out_flat[dropped] = x_flat[dropped]
                     else:
                         keep = idx
                     expert_out = experts[eid](x_flat[keep]) * top_scores[keep]
@@ -562,7 +565,8 @@ class MoELayer(nn.Module):
             routed_out = out_flat.view(bsz, seq, h)
 
             probe = self._ddp_probe_loss(dtype=x.dtype, device=x.device, alpha=getattr(self, "ddp_probe_alpha", 1e-8))
-            balance_loss = probe
+            if probe is not None:
+                balance_loss = (balance_loss if balance_loss is not None else 0.0) + probe
 
             return routed_out, balance_loss, updated_routing_state
 
@@ -571,7 +575,7 @@ class MoELayer(nn.Module):
             x_flat = x.view(-1, h)
             out_flat = torch.zeros_like(x_flat)
             capacity = int(self.capacity_factor * math.ceil(x_flat.size(0) * 2 / self.num_experts))
-            if not self.training:
+            if (not self.training) and (not STRICT_CAPACITY_IN_EVAL):
                 capacity = x_flat.size(0)
             for eid in range(self.num_experts):
                 for k in range(2):
@@ -588,7 +592,10 @@ class MoELayer(nn.Module):
                             if idx.numel() > capacity:
                                 keep = idx[:capacity]
                                 dropped = idx[capacity:]
-                                out_flat[dropped] += x_flat[dropped]
+                                if ZERO_OUT_DROPPED:
+                                    pass
+                                else:
+                                    out_flat[dropped] += x_flat[dropped]
                             else:
                                 keep = idx
                             expert_out = experts[eid](x_flat[keep]) * score[:keep.size(0)]
@@ -831,7 +838,7 @@ class MoELayer(nn.Module):
 
             top1_idx = affinities.argmax(dim=1)
             cap = int(math.ceil(N / self.num_experts) * self.capacity_factor)
-            if not self.training:
+            if (not self.training) and (not STRICT_CAPACITY_IN_EVAL):
                 cap = N
             cap = max(1, min(cap, N))
 
@@ -869,7 +876,10 @@ class MoELayer(nn.Module):
                     y = y * gate_sigmoid[keep]
                     out_flat[keep] = y
                 if drop.numel() > 0:
-                    out_flat[drop] = x_flat[drop]
+                    if ZERO_OUT_DROPPED:
+                        out_flat[drop].zero_()
+                    else:
+                        out_flat[drop] = x_flat[drop]
 
             routed = out_flat.view(bsz, seq, h)
             if distill_loss is not None:
