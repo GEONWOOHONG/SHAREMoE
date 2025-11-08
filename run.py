@@ -99,6 +99,7 @@ def main():
     tr.add_argument("--seq_len", type=int, default=1024)
     tr.add_argument("--grad_accum", type=int, default=1)
     tr.add_argument("--continue_training", action="store_true")
+    tr.add_argument("--mt", action="store_true")
 
     ev = sub.add_parser("eval")
     ev.add_argument("--mode", default="switch")
@@ -137,6 +138,7 @@ def main():
             seq_len=args.seq_len,
             grad_accum=args.grad_accum,
             continue_training=args.continue_training,
+            mt=args.mt,
         )
     elif args.cmd == "eval":
         from test import run_all_tests

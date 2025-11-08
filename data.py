@@ -32,10 +32,30 @@ def load_or_prepare_pile(cache_path=None, raw_cache=None, verbose=True):
             pass
 
     if verbose and _is_rank0():
-        print(f"🔹 Loading Geonwoohong/pile-uncopyrighted-6b-tokenized-gpt2 (cache_dir={cache_dir})")
+        print(f"🔹 Loading Geonwoohong/pile-uncopyrighted-train-tokenized-gpt2 (cache_dir={cache_dir})")
 
     ds = load_dataset(
-        "Geonwoohong/pile-uncopyrighted-6b-tokenized-gpt2",
+        "Geonwoohong/pile-uncopyrighted-train-tokenized-gpt2",
         cache_dir=cache_dir
     )
+    return ds["train"], ds["validation"]
+
+def load_or_prepare_mt(cache_path=None, raw_cache=None, verbose=True):
+    cache_dir = os.environ.get("HF_DATASETS_CACHE", None)
+
+    if (not _is_rank0()) or (not verbose):
+        try:
+            ds_logging.set_verbosity_error()
+            ds_logging.disable_progress_bar()
+        except Exception:
+            pass
+
+    if verbose and _is_rank0():
+        print(f"🔹 Loading Geonwoohong/wmt21-train-tokenized-sentencepiece (cache_dir={cache_dir})")
+
+    ds = load_dataset(
+        "Geonwoohong/wmt21-train-tokenized-sentencepiece",
+        cache_dir=cache_dir,
+    )
+
     return ds["train"], ds["validation"]

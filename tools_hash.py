@@ -2,19 +2,22 @@
 import os, torch
 from tqdm import tqdm
 from collections import Counter
-from data import load_or_prepare_pile
 from modeling import HashRouter
-from config import HASH_TABLE_PATH
+from data import load_or_prepare_pile, load_or_prepare_mt
+from config import HASH_TABLE_PATH, get_hash_table_path
 
-def create_global_hash_table(num_experts):
-    if os.path.exists(HASH_TABLE_PATH):
-        print(f"✅ Global hash table already exists. Skipping creation.")
-        return
+def create_global_hash_table(num_experts, vocab_size=50257, save_path=None, mt=False):
+    if save_path is None:
+        save_path = get_hash_table_path(vocab_size)
+
+    if os.path.exists(save_path):
+        print(f"✅ Global hash table already exists at {save_path}. Skipping creation.")
+        return save_path
 
     print("--- 🌍 Starting Optimized Hash Table Creation (Full Dataset) ---")
-    train_dataset, _ = load_or_prepare_pile()
+    train_dataset, _ = (load_or_prepare_mt() if mt else load_or_prepare_pile())
     sample_dataset = train_dataset
-    print(f"📊 Using the FULL train dataset of {len(sample_dataset):,} documents...")
+    print(f"📊 Using the FULL train dataset of {len(sample_dataset):,} documents.")
 
     def count_tokens_in_batch(batch):
         tokens_list = []
@@ -53,9 +56,12 @@ def create_global_hash_table(num_experts):
     freq_dict_data = total_counter
     print("🛠️ Creating balanced assignment table...")
     temp_router = HashRouter(
-        vocab_size=50257, num_experts=num_experts, method="balanced",
+        vocab_size=vocab_size,
+        num_experts=num_experts, method="balanced",
         freq_dict=freq_dict_data, device='cpu'
     )
-    os.makedirs(os.path.dirname(HASH_TABLE_PATH), exist_ok=True)
-    torch.save(temp_router.table_tensor.cpu(), HASH_TABLE_PATH)
-    print(f"✅ Global hash table saved successfully to {HASH_TABLE_PATH}")
+    
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    torch.save(temp_router.table_tensor.cpu(), save_path)
+    print(f"✅ Global hash table saved successfully to {save_path}")
+    return save_path

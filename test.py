@@ -11,7 +11,6 @@ import time, numpy as np, torch
 from torch.utils.data import DataLoader
 from transformers import GPT2Config, GPT2LMHeadModel
 from datasets import load_dataset
-from tqdm import tqdm
 import pandas as pd
 from contextlib import nullcontext
 
@@ -22,24 +21,25 @@ from patches import (
     patch_model_for_hash_moe,
     patch_model_for_ours_com,
     patch_model_for_stablemoe,
+    patch_model_for_ours_refine,
 )
 from train import evaluate as eval_ppl_only, compute_moe_stats
 from utils import ensure_flash_attn, set_seed, load_safetensors
 
-from config import CHECKPOINTS_DIR, HASH_TABLE_PATH
+from config import CHECKPOINTS_DIR, get_hash_table_path
 from tools_hash import create_global_hash_table
 
 def load_or_prepare_wt103():
     cache_dir = os.environ.get("HF_DATASETS_CACHE", None)
-    return load_dataset("Geonwoohong/wikitext-103-raw-v1-283k-tokenized-gpt2", cache_dir=cache_dir)
+    return load_dataset("Geonwoohong/wikitext-103-raw-v1-test-tokenized-gpt2", cache_dir=cache_dir)
 
 def load_or_prepare_cc100():
     cache_dir = os.environ.get("HF_DATASETS_CACHE", None)
-    return load_dataset("Geonwoohong/cc100-en-1m-tokenized-gpt2", cache_dir=cache_dir)
+    return load_dataset("Geonwoohong/cc100-en-test-tokenized-gpt2", cache_dir=cache_dir)
 
 def load_or_prepare_owt1m():
     cache_dir = os.environ.get("HF_DATASETS_CACHE", None)
-    return load_dataset("Geonwoohong/openwebtext-1m-tokenized-gpt2", cache_dir=cache_dir)
+    return load_dataset("Geonwoohong/openwebtext-test-tokenized-gpt2", cache_dir=cache_dir)
 
 @torch.no_grad()
 def measure_prefill_throughput(model, batch, dtype=torch.bfloat16, warmup=5, iters=20):
@@ -224,13 +224,14 @@ def run_all_tests(batch_size=44, base_num_experts=16):
                 else:
                     eff_num_experts = base_num_experts
 
-                if mode == "hash" and not os.path.exists(HASH_TABLE_PATH):
-                    print(f"⚠️  Hash table not found at {HASH_TABLE_PATH}. Auto-building now for eval...")
-                    create_global_hash_table(base_num_experts)
-
+                vsz = int(getattr(config, "vocab_size", 50257))
+                hash_path = get_hash_table_path(vsz)
+                if mode == "hash" and not os.path.exists(hash_path):
+                    print(f"⚠️  Hash table not found at {hash_path}. Auto-building now for eval.")
+                    create_global_hash_table(base_num_experts, vocab_size=vsz, save_path=hash_path, mt=(vsz==32000))
                 extra = {}
                 if mode == "hash":
-                    extra["freq_dict"] = {"__load_from_file__": HASH_TABLE_PATH}
+                    extra["freq_dict"] = {"__load_from_file__": hash_path}
                 if mode == "stablemoe":
                     extra.update(dict(stable_routing_dim=50, stable_balance_alpha=0.3))
                 model = convert_gpt2_to_moe(
@@ -240,8 +241,10 @@ def run_all_tests(batch_size=44, base_num_experts=16):
 
             if mode == "hash":
                 patch_model_for_hash_moe(model)
-            elif mode in ("ours_com", "ours_refine"):
+            elif mode == "ours_com":
                 patch_model_for_ours_com(model)
+            elif mode == "ours_refine":
+                patch_model_for_ours_refine(model)
             elif mode == "stablemoe":
                 patch_model_for_stablemoe(model)
             elif mode != "dense":

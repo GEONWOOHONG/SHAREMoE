@@ -335,13 +335,15 @@ class Router(nn.Module):
 
 class MoELayer(nn.Module):
     def __init__(self, d_model, d_ff, num_experts,
-                mode="switch", shared_expert=None, global_experts=None,
-                alpha=0.01, capacity_factor=1.25, freq_dict=None,
-                shared_router: RecurrentRouter=None,
-                xmoe_threshold: float = 0.90,
-                xmoe_capacity_factor: float = 1.0,
-                xmoe_expert_mult: float = 0.25):
+                 mode="switch", shared_expert=None, global_experts=None,
+                 alpha=0.01, capacity_factor=1.25, freq_dict=None,
+                 shared_router: RecurrentRouter=None,
+                 xmoe_threshold: float = 0.90,
+                 xmoe_capacity_factor: float = 1.0,
+                 xmoe_expert_mult: float = 0.25,
+                 vocab_size: int = 50257):
         super().__init__()
+        self.vocab_size = int(vocab_size) 
         self.d_model = d_model
         self.mode = mode
         self.num_experts = num_experts
@@ -406,7 +408,7 @@ class MoELayer(nn.Module):
         elif mode == "hash":
             self.experts = nn.ModuleList([Expert(d_model, d_ff) for _ in range(num_experts)])
             self.hash_router = HashRouter(
-                vocab_size=50257,
+                vocab_size=self.vocab_size,
                 num_experts=num_experts,
                 method="balanced",
                 freq_dict=freq_dict
@@ -963,6 +965,7 @@ class GPT2LayerMoE(nn.Module):
             xmoe_threshold=xmoe_threshold,
             xmoe_capacity_factor=xmoe_capacity_factor,
             xmoe_expert_mult=xmoe_expert_mult,
+            vocab_size=getattr(config, "vocab_size", 50257),
         )
         self.layer_idx = 0 if layer_idx is None else int(layer_idx)
         setattr(self.moe, "_layer_idx", self.layer_idx)

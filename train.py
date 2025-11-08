@@ -6,9 +6,6 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader
 from transformers import GPT2Config, GPT2LMHeadModel
 from safetensors.torch import load_model
-from config import RUNS_DIR, HASH_TABLE_PATH
-from data import load_or_prepare_pile, worker_init_fn, get_dataloader_generator
-from modeling import convert_gpt2_to_moe, GPT2LayerMoE
 
 from patches import (
     patch_model_basic,
@@ -25,8 +22,10 @@ from utils import (
     enable_sdp_backends, prefer_flash_attention, print_attn_stack_status,
 )
 
-from config import HASH_TABLE_PATH
+from config import RUNS_DIR, get_hash_table_path
 from tools_hash import create_global_hash_table
+from data import load_or_prepare_pile, worker_init_fn, get_dataloader_generator, load_or_prepare_mt
+from modeling import convert_gpt2_to_moe, GPT2LayerMoE
 
 from torch.utils.tensorboard import SummaryWriter
 
@@ -42,7 +41,7 @@ def init_distributed():
     return False, 0, 1, 0
 
 @torch.no_grad()
-def evaluate(model, dataloader, device, show_bar=False, desc="Valid"):
+def evaluate(model, dataloader, device, show_bar=False, desc="Valid", use_mt=False):
     is_dist = torch.distributed.is_available() and torch.distributed.is_initialized()
     is_main = (not is_dist) or (dist.get_rank() == 0)
 
@@ -59,7 +58,8 @@ def evaluate(model, dataloader, device, show_bar=False, desc="Valid"):
         attn      = batch["attention_mask"].to(device, non_blocking=True)
 
         labels = input_ids.clone()
-        labels[labels == enc.eot_token] = -100
+        if not use_mt:
+            labels[labels == enc.eot_token] = -100
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
             logits = model(
@@ -122,7 +122,7 @@ def compute_moe_stats(model, config, mode):
             balance_scores.append(entropy)
     return {"balance": sum(balance_scores) / len(balance_scores) if balance_scores else 0.0}
 
-def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_accum=1, continue_training=False):
+def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_accum=1, continue_training=False, mt=False):
     is_dist, rank, world_size, local_rank = init_distributed()
 
     def is_main(): return (not is_dist) or (rank == 0)
@@ -151,18 +151,20 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
             print(f"🧮 xmoe mode: num_experts overridden {num_experts} → {eff_num_experts} (×4)")
         if mode in ("ours_com", "ours_refine"):
             print(f"🧮 ours mode: globals={num_experts}, total_passed={eff_num_experts} (=globals+1 local)")
-
+    
+    vocab_size = 32000 if mt else 50257
     freq_dict = None
     if mode == "hash":
-        if not os.path.exists(HASH_TABLE_PATH):
+        hash_path = get_hash_table_path(vocab_size)
+        if not os.path.exists(hash_path):
             if is_main():
-                print(f"⚠️  Hash table not found at {HASH_TABLE_PATH}. Auto-building now...")
-                create_global_hash_table(num_experts)
+                print(f"⚠️  Hash table not found at {hash_path}. Auto-building now.")
+                create_global_hash_table(num_experts, vocab_size=vocab_size, save_path=hash_path, mt=mt)
             if is_dist:
                 dist.barrier()
         if is_main():
-            print(f"🔹 Loading global hash table from: {HASH_TABLE_PATH}")
-        freq_dict = {'__load_from_file__': HASH_TABLE_PATH}
+            print(f"🔹 Loading global hash table from: {hash_path}")
+        freq_dict = {'__load_from_file__': hash_path}
 
     trainer_state = None
     if continue_training:
@@ -181,7 +183,14 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
         trainer_state = torch.load(trainer_path, map_location="cpu")
         print(f"🔹 Restoring optimizer/scheduler from {trainer_path}")
     else:
-        config = GPT2Config(vocab_size=50257, n_positions=1024, n_ctx=1024, n_embd=1024, n_layer=8, n_head=8)
+        config = GPT2Config(
+            vocab_size=vocab_size,
+            n_positions=1024,
+            n_ctx=1024,
+            n_embd=1024,
+            n_layer=8,
+            n_head=8
+        )
         model = GPT2LMHeadModel(config)
         stable_args = dict(stable_routing_dim=50, stable_balance_alpha=0.3)
         
@@ -210,7 +219,12 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
     if (not is_dist) or (rank == 0):
         print_attn_stack_status(model, tag=f"impl={impl}")
 
-    train_dataset, valid_dataset = load_or_prepare_pile(verbose=is_main())
+    train_dataset, valid_dataset = (
+        load_or_prepare_mt(verbose=is_main())
+        if mt else
+        load_or_prepare_pile(verbose=is_main())
+    )
+
     valid_dataset = valid_dataset.select(range(int(0.1 * len(valid_dataset))))
     
     if is_main():
@@ -386,7 +400,8 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
             attn      = batch["attention_mask"].to(device, non_blocking=True)
 
             labels = input_ids.clone()
-            labels[labels == enc.eot_token] = -100
+            if not mt:
+                labels[labels == enc.eot_token] = -100
 
             sync_now = (step % grad_accum) == 0
             ctx = (model.no_sync() if (is_dist and not sync_now) else contextlib.nullcontext())
@@ -450,9 +465,8 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
                     if progress_bar:
                         progress_bar.write(msg)
 
-                    valid_loss, valid_ppl = evaluate(model, valid_loader, device,
-                                 show_bar=True,
-                                 desc=f"Valid @ step {optim_step}")
+                    valid_loss, valid_ppl = evaluate(model, valid_loader, device, show_bar=True,
+                                 desc=f"Valid @ step {optim_step}", use_mt=mt)
                     stats = compute_moe_stats(base_model, config, mode) if (optim_step % five_percent_interval == 0) else {"balance": 0.0}
 
                     if is_main():
