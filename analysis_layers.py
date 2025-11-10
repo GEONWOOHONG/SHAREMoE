@@ -84,7 +84,6 @@ def _register_hooks(model: nn.Module, rec: _Recorder):
         lidx = getattr(module, "_layer_idx", None)
         if lidx is not None:
             rec.post_mlp[lidx].append(flat)
-
         for m in module.modules():
             if isinstance(m, MoELayer):
                 scores = None
@@ -95,7 +94,8 @@ def _register_hooks(model: nn.Module, rec: _Recorder):
                 elif getattr(m, "last_scores", None) is not None:
                     scores = m.last_scores
                 if scores is not None and rec.save_routes:
-                    rec.route_dist[lidx].append(scores.detach().to(torch.float32).cpu())
+                    probs = torch.softmax(scores, dim=-1)
+                    rec.route_dist[lidx].append(probs.detach().to(torch.float32).cpu())
 
     for name, module in model.named_modules():
         m = pat.match(name)
@@ -110,36 +110,79 @@ def _register_hooks(model: nn.Module, rec: _Recorder):
 @torch.no_grad()
 def compute_A_metrics(rec: _Recorder) -> Dict:
     layers = sorted(set(rec.layers))
-    out = {"LEI": {}, "InterCKA": {}, "IntraRedundancyProxy": {}}
-
+    out = {"LEI": {}, "InterCKA": {}, "InterCKA_by_delta": {}, "IntraRedundancyProxy": {}, "RoutingUsageEntropy": {}, "ActiveExperts": {}, "EmptyExpertsRatio": {}, "IntraExpertCKA": {}}
     for l in layers:
         X, Y = rec.get_pair(l)
         if X is None or Y is None or X.size(0) != Y.size(0):
             continue
         cos = _cosine_similarity(X, Y)
         out["LEI"][l] = float((1.0 - cos.mean()).item())
-
     reps = {l: rec.get_pair(l)[1] for l in layers}
     valid_layers = [l for l in layers if reps.get(l) is not None]
+    inter_pairs = {}
     for i, l1 in enumerate(valid_layers):
         for l2 in valid_layers[i+1:]:
             X, Y = reps[l1], reps[l2]
             n = min(X.size(0), Y.size(0))
             cka = _cka_linear(X[:n], Y[:n])
-            out["InterCKA"][f"{l1}-{l2}"] = float(cka.item())
-
+            key = f"{l1}-{l2}"
+            inter_pairs[key] = float(cka.item())
+    out["InterCKA"] = inter_pairs
+    delta_acc = collections.defaultdict(list)
+    for k, v in inter_pairs.items():
+        a, b = k.split("-")
+        d = abs(int(a) - int(b))
+        delta_acc[d].append(v)
+    out["InterCKA_by_delta"] = {int(d): float(np.mean(v)) for d, v in delta_acc.items()}
     for l in layers:
         P = rec.get_routes(l)
-        if P is None: 
+        if P is None:
             continue
         E = P.shape[1]
-        if E < 2: 
+        if E < 2:
             continue
+        counts = torch.argmax(P, dim=-1).bincount(minlength=E).to(torch.float32)
+        freq = counts / counts.sum().clamp_min(1e-9)
+        usage_entropy = float(_entropy(freq).item())
+        active = int((freq > 0.01).sum().item())
+        empty_ratio = float((freq == 0).float().mean().item())
         Q = P / (P.norm(dim=0, keepdim=True) + 1e-9)
         S = torch.einsum("ne,nk->ek", Q, Q)
         mask = (~torch.eye(E, dtype=torch.bool))
-        out["IntraRedundancyProxy"][l] = float(S[mask].mean().item())
-
+        intra_proxy = float(S[mask].mean().item())
+        out["RoutingUsageEntropy"][l] = usage_entropy
+        out["ActiveExperts"][l] = active
+        out["EmptyExpertsRatio"][l] = empty_ratio
+        top1 = torch.argmax(P, dim=-1)
+        min_tokens = 32
+        max_tokens = 512
+        feats = rec.get_pair(l)[1]
+        if feats is not None:
+            per_expert_indices = []
+            for e in range(E):
+                idx = torch.nonzero(top1 == e, as_tuple=False).view(-1)
+                if idx.numel() >= min_tokens:
+                    if idx.numel() > max_tokens:
+                        idx = idx[torch.linspace(0, idx.numel() - 1, steps=max_tokens).long()]
+                    per_expert_indices.append((e, idx))
+            cka_vals = []
+            for i in range(len(per_expert_indices)):
+                ei, ii = per_expert_indices[i]
+                Xi = feats[ii]
+                for j in range(i + 1, len(per_expert_indices)):
+                    ej, jj = per_expert_indices[j]
+                    Xj = feats[jj]
+                    n = min(Xi.size(0), Xj.size(0))
+                    if n >= min_tokens:
+                        c = _cka_linear(Xi[:n], Xj[:n]).item()
+                        cka_vals.append(c)
+            if len(cka_vals) > 0:
+                out["IntraExpertCKA"][l] = float(np.mean(cka_vals))
+            else:
+                out["IntraExpertCKA"][l] = float("nan")
+        else:
+            out["IntraExpertCKA"][l] = float("nan")
+        out["IntraRedundancyProxy"][l] = intra_proxy
     return out
 
 @torch.no_grad()
@@ -152,31 +195,14 @@ def run_analysis_A(mode: str = "ours_refine",
                    sample_fraction: float = 0.10,
                    use_flash_attn: bool = True,
                    verbose: bool = True):
-    """
-    Computes Part A only and saves JSON.
-    
-    Args:
-        mode: Model mode (dense, switch, gshard, hash, ours_refine)
-        num_experts: Number of experts
-        batch_size: Batch size
-        seq_len: Sequence length
-        max_batches: Max batches to process (None = use sample_fraction)
-        save_json: Path to save JSON results (None = auto-generate)
-        sample_fraction: Fraction of validation data when max_batches is None
-        use_flash_attn: Whether to use Flash Attention
-        verbose: Whether to print progress
-    """
     assert mode in {"dense","switch","gshard","hash","ours_refine"}, f"Unsupported mode: {mode}"
-
     set_seed(42)
     if use_flash_attn:
         ensure_flash_attn()
-
     if verbose:
         print(f"\n{'='*70}")
-        print(f"🔎 Layer-Level Analysis (Part A) - Mode: {mode}")
+        print(f"Layer-Level Analysis (Part A) - Mode: {mode}")
         print(f"{'='*70}")
-
     loader, total_batches, effective_batches = make_validation_dataloader(
         batch_size=batch_size,
         seq_len=seq_len,
@@ -185,30 +211,28 @@ def run_analysis_A(mode: str = "ours_refine",
         dataset_name="pile",
         verbose=verbose
     )
-
     config = GPT2Config(vocab_size=50257, n_positions=1024, n_ctx=1024, n_embd=1024, n_layer=8, n_head=8)
     model = build_model_for_mode(mode, num_experts=num_experts, config=config)
-
     load_checkpoint_if_exists(model, mode, CHECKPOINTS_DIR, strict=False)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device).eval()
-
     rec = _Recorder(max_tokens=8192, save_routes=True)
     handles = _register_hooks(model, rec)
-
     processed = 0
     t0 = time.time()
     for i, batch in enumerate(loader):
         if i >= effective_batches: break
         input_ids = batch["input_ids"][:, :seq_len].to(device, non_blocking=True)
         attn      = batch["attention_mask"][:, :seq_len].to(device, non_blocking=True)
-        with torch.autocast("cuda", dtype=torch.bfloat16) if device.type == "cuda" else torch.inference_mode():
-            _ = model(input_ids=input_ids, attention_mask=attn, use_cache=False)
+        with torch.inference_mode():
+            if device.type == "cuda":
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    _ = model(input_ids=input_ids, attention_mask=attn, use_cache=False)
+            else:
+                _ = model(input_ids=input_ids, attention_mask=attn, use_cache=False)
         processed += 1
         if verbose and processed % 10 == 0:
-            print(f"  • Processed {processed}/{effective_batches} batches...")
-
+            print(f"Processed {processed}/{effective_batches} batches")
     resA = compute_A_metrics(rec)
     result = {
         "mode": mode,
@@ -218,24 +242,19 @@ def run_analysis_A(mode: str = "ours_refine",
         "runtime_sec": float(time.time() - t0),
         "A": resA,
     }
-
     if save_json is None:
         save_json = os.path.join(CHECKPOINTS_DIR, f"analysis_A_{mode}.json")
     os.makedirs(os.path.dirname(save_json), exist_ok=True)
     with open(save_json, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2)
-    
     if verbose:
-        print(f"📄 Saved Part-A metrics to: {save_json}")
-        print(f"⏱️  Runtime: {result['runtime_sec']:.2f}s")
-
+        print(f"Saved Part-A metrics to: {save_json}")
+        print(f"Runtime: {result['runtime_sec']:.2f}s")
     for h in handles:
         try: h.remove()
         except Exception: pass
-
     del model
     torch.cuda.empty_cache()
-
     return result
 
 if __name__ == "__main__":
@@ -250,7 +269,6 @@ if __name__ == "__main__":
     ap.add_argument("--sample_fraction", type=float, default=0.10)
     ap.add_argument("--no_flash", action="store_true")
     args = ap.parse_args()
-
     run_analysis_A(
         mode=args.mode,
         num_experts=args.num_experts,
