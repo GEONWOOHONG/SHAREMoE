@@ -320,3 +320,66 @@ def chunked_cross_entropy(logits, labels, ignore_index=-100, chunk_tokens=8192):
 
     denom = max(valid, 1)
     return total / denom
+
+def build_model_for_mode(mode: str, num_experts: int = 16, config=None):
+    from transformers import GPT2Config, GPT2LMHeadModel
+    from modeling import convert_gpt2_to_moe
+    from patches import (
+        patch_model_basic,
+        patch_model_for_hash_moe,
+        patch_model_for_ours_refine,
+    )
+    
+    assert mode in {"dense", "switch", "gshard", "hash", "ours_refine", "ours_com"}, \
+        f"Unsupported mode: {mode}"
+    
+    if config is None:
+        config = GPT2Config(
+            vocab_size=50257,
+            n_positions=1024,
+            n_ctx=1024,
+            n_embd=1024,
+            n_layer=8,
+            n_head=8
+        )
+    
+    model = GPT2LMHeadModel(config)
+    
+    if mode == "dense":
+        patch_model_basic(model)
+    else:
+        eff_num_experts = num_experts if mode != "ours_refine" else (num_experts + 1)
+        model = convert_gpt2_to_moe(model, config, mode=mode, num_experts=eff_num_experts, alpha=0.01)
+        
+        if mode == "hash":
+            patch_model_for_hash_moe(model)
+        elif mode in ("ours_refine", "ours_com"):
+            patch_model_for_ours_refine(model)
+        else:
+            patch_model_basic(model)
+    
+    return model
+
+def find_checkpoint_path(mode: str, checkpoints_dir: str) -> str:
+    d = os.path.join(checkpoints_dir, f"{mode}_exp1")
+    if not os.path.isdir(d):
+        return None
+    
+    for name in ["best_checkpoint.safetensors", "last_checkpoint.safetensors",
+                 "best_checkpoint.safetensors.safetensors", "last_checkpoint.safetensors.safetensors"]:
+        p = os.path.join(d, name)
+        if os.path.exists(p):
+            return p
+    return None
+
+def load_checkpoint_if_exists(model, mode: str, checkpoints_dir: str, strict: bool = False):
+    ckpt_path = find_checkpoint_path(mode, checkpoints_dir)
+    if ckpt_path:
+        load_safetensors(model, ckpt_path, mode=mode, strict=strict)
+        if _is_rank0():
+            print(f"✅ Loaded checkpoint: {ckpt_path}")
+        return True
+    else:
+        if _is_rank0():
+            print(f"⚠️ No checkpoint found for mode={mode}; using random initialization.")
+        return False

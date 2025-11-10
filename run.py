@@ -14,6 +14,8 @@ import argparse
 from train import train_moe
 from utils import set_seed
 from analysis_expert_mapping import run_mapping_analysis
+from analysis_layers import run_analysis_A
+from analysis_specialization_confidence import run_specialization_confidence
 
 def _setenv_if_missing(k, v):
     if os.environ.get(k) in (None, ""):
@@ -108,27 +110,99 @@ def main():
     ev.add_argument("--seq_len", type=int, default=1024)
     
     an = sub.add_parser("analysis")
+    an.add_argument("--modes", type=str, default="switch,gshard,hash,ours_refine", help="Comma-separated mode list")
     an.add_argument("--num_experts", type=int, default=16)
     an.add_argument("--batch_size", type=int, default=44)
+    an.add_argument("--seq_len", type=int, default=1024)
     an.add_argument("--max_batches", type=int, default=None, help="Maximum number of batches to analyze (None for 10% of total)")
+    an.add_argument("--sample_fraction", type=float, default=0.10, help="Fraction of validation batches when max_batches is None")
     an.add_argument("--debug", action="store_true", help="Debug mode: use only 0.1% of validation data for quick testing")
+    an.add_argument("--skip_mapping", action="store_true", help="Skip legacy mapping analysis")
+    an.add_argument("--skip_layers", action="store_true", help="Skip layer-level analysis (LEI, CKA, etc.)")
+    an.add_argument("--skip_specialization", action="store_true", help="Skip specialization & confidence analysis")
+    an.add_argument("--no_flash", action="store_true", help="Disable Flash Attention")
 
     args = ap.parse_args()
 
     if args.cmd == "analysis":
         set_seed(42)
-        debug_max_batches = args.max_batches
-        if args.debug and args.max_batches is None:
-            debug_max_batches = "debug"
+        modes_list = [m.strip() for m in args.modes.split(",") if m.strip()]
         
-        run_mapping_analysis(
-            batch_size=args.batch_size,
-            base_num_experts=args.num_experts,
-            max_batches=debug_max_batches,
-            run_specialization=True,
-            run_confidence=True,
-            run_routes=True,
-        )
+        # Adjust sample_fraction for debug mode
+        sample_frac = 0.001 if args.debug else args.sample_fraction
+        max_batches = args.max_batches
+        if args.debug and max_batches is None:
+            max_batches = 2  # minimal batches for debug
+        
+        print("\n" + "="*80)
+        print("🔍 ANALYSIS ORCHESTRATOR")
+        print("="*80)
+        print(f"Modes: {modes_list}")
+        print(f"Num Experts: {args.num_experts}")
+        print(f"Batch Size: {args.batch_size}")
+        print(f"Max Batches: {max_batches if max_batches else f'Auto (~{sample_frac*100:.1f}%)'}")
+        print(f"Debug Mode: {args.debug}")
+        print("="*80 + "\n")
+        
+        # 1) Legacy mapping analysis (optional backward compatibility)
+        if not args.skip_mapping:
+            print("\n[1/3] Running legacy mapping analysis...")
+            try:
+                debug_max_batches = "debug" if args.debug else max_batches
+                run_mapping_analysis(
+                    batch_size=args.batch_size,
+                    base_num_experts=args.num_experts,
+                    max_batches=debug_max_batches,
+                    run_specialization=True,
+                    run_confidence=True,
+                    run_routes=True,
+                )
+            except Exception as e:
+                print(f"⚠️ Legacy mapping analysis failed: {e}")
+        else:
+            print("\n[1/3] Skipping legacy mapping analysis (--skip_mapping)")
+        
+        # 2) Layer-level analysis (LEI, CKA, Intra-redundancy)
+        if not args.skip_layers:
+            print("\n[2/3] Running layer-level analysis (LEI, CKA, etc.)...")
+            for mode in modes_list:
+                print(f"\n  → Analyzing mode: {mode}")
+                try:
+                    run_analysis_A(
+                        mode=mode,
+                        num_experts=args.num_experts,
+                        batch_size=args.batch_size,
+                        seq_len=args.seq_len,
+                        max_batches=max_batches,
+                        sample_fraction=sample_frac,
+                        use_flash_attn=not args.no_flash,
+                    )
+                except Exception as e:
+                    print(f"⚠️ Layer analysis failed for {mode}: {e}")
+        else:
+            print("\n[2/3] Skipping layer-level analysis (--skip_layers)")
+        
+        # 3) Specialization & Confidence analysis
+        if not args.skip_specialization:
+            print("\n[3/3] Running specialization & confidence analysis...")
+            try:
+                run_specialization_confidence(
+                    modes=modes_list,
+                    num_experts=args.num_experts,
+                    batch_size=args.batch_size,
+                    seq_len=args.seq_len,
+                    max_batches=max_batches,
+                    use_flash_attn=not args.no_flash,
+                    sample_fraction=sample_frac,
+                )
+            except Exception as e:
+                print(f"⚠️ Specialization & confidence analysis failed: {e}")
+        else:
+            print("\n[3/3] Skipping specialization & confidence analysis (--skip_specialization)")
+        
+        print("\n" + "="*80)
+        print("✅ ANALYSIS COMPLETE")
+        print("="*80)
     elif args.cmd == "train":
         set_seed(42)
         train_moe(
@@ -150,6 +224,20 @@ if __name__ == "__main__":
 #python run.py train --mode stablemoe --num_experts 16 --batch_size 44 --seq_len 1024 --grad_accum 1
 #torchrun --nproc_per_node=4 --master_port=29600 run.py train --mode ours_refine --num_experts 16 --batch_size 44 --seq_len 1024 --grad_accum 1
 #python run.py eval --batch_size 44 --num_experts 16
+
+# Full analysis (all modes, all metrics):
+#python run.py analysis --modes switch,gshard,hash,ours_refine --batch_size 44 --num_experts 16
+
+# Quick debug run (0.1% data, 2 batches):
+#python run.py analysis --modes ours_refine --debug
+
+# Custom sample fraction (5% of validation):
+#python run.py analysis --modes switch,ours_refine --sample_fraction 0.05
+
+# Skip specific analyses:
+#python run.py analysis --skip_mapping --modes ours_refine  # only layer + specialization
+#python run.py analysis --skip_layers --modes ours_refine   # only mapping + specialization
+#python run.py analysis --skip_specialization --modes ours_refine  # only mapping + layer
 
 #apt update && apt install -y nano zip unzip && pip install transformers datasets tensorboard pandas tqdm scipy tiktoken safetensors huggingface_hub hf_transfer calflops
 #tensorboard --logdir=/workspace/runs --host=0.0.0.0 --port=6006
