@@ -23,22 +23,12 @@ def get_dataloader_generator(rank=0):
 
 def load_or_prepare_pile(cache_path=None, raw_cache=None, verbose=True):
     cache_dir = os.environ.get("HF_DATASETS_CACHE", None)
-
-    if (not _is_rank0()) or (not verbose):
-        try:
-            ds_logging.set_verbosity_error()
-            ds_logging.disable_progress_bar()
-        except Exception:
-            pass
-
-    if verbose and _is_rank0():
-        print(f"🔹 Loading Geonwoohong/pile-uncopyrighted-train-tokenized-gpt2 (cache_dir={cache_dir})")
-
-    ds = load_dataset(
-        "Geonwoohong/pile-uncopyrighted-train-tokenized-gpt2",
-        cache_dir=cache_dir
-    )
-    return ds["train"], ds["validation"]
+    if verbose:
+        print(f"🔹 Loading Geonwoohong/pile-uncopyrighted-tokenized-gpt2 (cache_dir={cache_dir})")
+    ds = load_dataset("Geonwoohong/pile-uncopyrighted-tokenized-gpt2", cache_dir=cache_dir)
+    # test가 없으면 None 반환
+    test_split = ds["test"] if "test" in ds.keys() else None
+    return ds["train"], ds["validation"], test_split
 
 def load_or_prepare_mt(cache_path=None, raw_cache=None, verbose=True):
     cache_dir = os.environ.get("HF_DATASETS_CACHE", None)
@@ -72,7 +62,7 @@ def make_validation_dataloader(
     from torch.utils.data import DataLoader
     
     if dataset_name == "pile":
-        _, valid = load_or_prepare_pile(verbose=verbose)
+        _, valid, _ = load_or_prepare_pile(verbose=verbose)
         valid.set_format(type="torch", columns=["input_ids", "attention_mask"])
     elif dataset_name == "mt":
         _, valid = load_or_prepare_mt(verbose=verbose)

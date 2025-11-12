@@ -219,11 +219,10 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
     if (not is_dist) or (rank == 0):
         print_attn_stack_status(model, tag=f"impl={impl}")
 
-    train_dataset, valid_dataset = (
-        load_or_prepare_mt(verbose=is_main())
-        if mt else
-        load_or_prepare_pile(verbose=is_main())
-    )
+    if mt:
+        train_dataset, valid_dataset = load_or_prepare_mt(verbose=is_main())
+    else:
+        train_dataset, valid_dataset, _ = load_or_prepare_pile(verbose=is_main())
 
     valid_dataset = valid_dataset.select(range(int(0.1 * len(valid_dataset))))
     

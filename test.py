@@ -140,40 +140,59 @@ def run_all_tests(batch_size=44, base_num_experts=16):
     set_seed(42)
     if torch.cuda.is_available():
         ensure_flash_attn()
-    _, pile_valid = load_or_prepare_pile(verbose=True)
-    pile_valid.set_format(type="torch", columns=["input_ids", "attention_mask"])
-    pile_valid = pile_valid.select(range(int(0.1 * len(pile_valid))))
+
+    train_ds, pile_valid, pile_test = load_or_prepare_pile(verbose=True)
+
+    if pile_test is not None:
+        pile_test.set_format(type="torch", columns=["input_ids", "attention_mask"])
+        pile_eval = pile_test
+        pile_label_name = "Pile Test Loss"
+    else:
+        pile_valid.set_format(type="torch", columns=["input_ids", "attention_mask"])
+        pile_eval = pile_valid.select(range(int(0.1 * len(pile_valid))))
+        pile_label_name = "Pile Valid Loss"
+
     wt = load_or_prepare_wt103()
     wt_test = wt["test"]
     wt_test.set_format(type="torch", columns=["input_ids", "attention_mask"])
+
     cc100 = load_or_prepare_cc100()
     cc100_test = cc100["test"]
     cc100_test.set_format(type="torch", columns=["input_ids", "attention_mask"])
+
     owt = load_or_prepare_owt1m()
     owt_test = owt["test"]
     owt_test.set_format(type="torch", columns=["input_ids", "attention_mask"])
+
     num_workers = min(8, max(2, ((os.cpu_count() or 8)//2)))
-    wt_loader = DataLoader(wt_test, batch_size=batch_size, shuffle=False,
-                           num_workers=num_workers, pin_memory=True,
-                           prefetch_factor=2, persistent_workers=False,
-                           worker_init_fn=worker_init_fn,
-                           generator=get_dataloader_generator(0))
-    cc100_loader = DataLoader(cc100_test, batch_size=batch_size, shuffle=False,
-                              num_workers=num_workers, pin_memory=True,
-                              prefetch_factor=2, persistent_workers=False,
-                              worker_init_fn=worker_init_fn,
-                              generator=get_dataloader_generator(0))
-    owt_loader = DataLoader(owt_test, batch_size=batch_size, shuffle=False,
-                            num_workers=num_workers, pin_memory=True,
-                            prefetch_factor=2, persistent_workers=False,
-                            worker_init_fn=worker_init_fn,
-                            generator=get_dataloader_generator(0))
-    pile_loader = DataLoader(pile_valid, batch_size=batch_size, shuffle=False,
-                             num_workers=num_workers, pin_memory=True,
-                             prefetch_factor=2, persistent_workers=False,
-                             worker_init_fn=worker_init_fn,
-                             generator=get_dataloader_generator(0))
+
+    wt_loader = DataLoader(
+        wt_test, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=True,
+        prefetch_factor=2, persistent_workers=False,
+        worker_init_fn=worker_init_fn, generator=get_dataloader_generator(0)
+    )
+    cc100_loader = DataLoader(
+        cc100_test, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=True,
+        prefetch_factor=2, persistent_workers=False,
+        worker_init_fn=worker_init_fn, generator=get_dataloader_generator(0)
+    )
+    owt_loader = DataLoader(
+        owt_test, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=True,
+        prefetch_factor=2, persistent_workers=False,
+        worker_init_fn=worker_init_fn, generator=get_dataloader_generator(0)
+    )
+    pile_loader = DataLoader(
+        pile_eval, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=True,
+        prefetch_factor=2, persistent_workers=False,
+        worker_init_fn=worker_init_fn, generator=get_dataloader_generator(0)
+    )
+
     candidate_modes = ["dense","switch","gshard","hash","stablemoe","xmoe","ours_com","ours_refine","hypermoe"]
+
     def pick_ckpt(mode):
         d = os.path.join(CHECKPOINTS_DIR, f"{mode}_exp1")
         if not os.path.isdir(d):
@@ -191,13 +210,16 @@ def run_all_tests(batch_size=44, base_num_experts=16):
             if os.path.exists(p):
                 return p
         return None
+
     available = {m: pick_ckpt(m) for m in candidate_modes}
-    available = {m:p for m,p in available.items() if p}
+    available = {m: p for m, p in available.items() if p}
     if not available:
         print("No checkpoints available for evaluation. Please run training first.")
         return
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     results = {}
+
     for mode, ckpt_path in available.items():
         inp = msk = batch = None
         it = None
@@ -206,6 +228,7 @@ def run_all_tests(batch_size=44, base_num_experts=16):
         per = {"Checkpoint": ckpt_path}
         try:
             _GPT2Block.forward = _ORIG_GPT2BLOCK_FORWARD
+
             cfg_dir = os.path.dirname(ckpt_path)
             cfg_path = os.path.join(cfg_dir, "config.json")
             if os.path.exists(cfg_path):
@@ -215,7 +238,9 @@ def run_all_tests(batch_size=44, base_num_experts=16):
                     vocab_size=50257, n_positions=1024, n_ctx=1024,
                     n_embd=1024, n_layer=8, n_head=8
                 )
+
             model = GPT2LMHeadModel(config)
+
             if mode != "dense":
                 if mode in ("ours_com", "ours_refine"):
                     eff_num_experts = base_num_experts + 1
@@ -229,11 +254,13 @@ def run_all_tests(batch_size=44, base_num_experts=16):
                 if mode == "hash" and not os.path.exists(hash_path):
                     print(f"⚠️  Hash table not found at {hash_path}. Auto-building now for eval.")
                     create_global_hash_table(base_num_experts, vocab_size=vsz, save_path=hash_path, mt=(vsz==32000))
+
                 extra = {}
                 if mode == "hash":
                     extra["freq_dict"] = {"__load_from_file__": hash_path}
                 if mode == "stablemoe":
                     extra.update(dict(stable_routing_dim=50, stable_balance_alpha=0.3))
+
                 model = convert_gpt2_to_moe(
                     model, config, mode=mode,
                     num_experts=eff_num_experts, alpha=0.01, **extra
@@ -266,6 +293,7 @@ def run_all_tests(batch_size=44, base_num_experts=16):
                 "Prefill_B": pref["Prefill_B"],
                 "Prefill_T": pref["Prefill_T"],
             })
+
             prompt_ids = sample_batch["input_ids"][:, :128].to(device, non_blocking=True)
             dec = measure_decode_throughput(model, prompt_ids, gen_len=50, dtype=torch.bfloat16, warmup=20)
             per.update({
@@ -277,26 +305,31 @@ def run_all_tests(batch_size=44, base_num_experts=16):
                 "Decode_gen": dec["Decode_gen"],
             })
 
-            wt_loss, _   = eval_ppl_only(model, wt_loader,   device, show_bar=True, desc=f"WT103 {mode}")
+            # Perplexity들 계산
+            wt_loss, _    = eval_ppl_only(model, wt_loader,    device, show_bar=True, desc=f"WT103 {mode}")
             cc100_loss, _ = eval_ppl_only(model, cc100_loader, device, show_bar=True, desc=f"CC100 {mode}")
-            owt_loss, _   = eval_ppl_only(model, owt_loader, device, show_bar=True, desc=f"OWT1M {mode}")
-            pile_loss, _  = eval_ppl_only(model, pile_loader, device, show_bar=True, desc=f"Pile {mode}")
+            owt_loss, _   = eval_ppl_only(model, owt_loader,   device, show_bar=True, desc=f"OWT1M {mode}")
+            pile_loss, _  = eval_ppl_only(model, pile_loader,  device, show_bar=True, desc=f"Pile {mode}")
+
             stats = compute_moe_stats(model, config, mode)
             per.update({
                 "WikiText-103 Loss": wt_loss,
                 "CC100 Loss": cc100_loss,
                 "OpenWebText Loss": owt_loss,
-                "Pile Valid Loss": pile_loss,
+                pile_label_name: pile_loss,
                 "Expert Balance (entropy)": stats.get("balance", 0.0),
             })
+
             print(
                 f"{mode}: WT103-Loss={wt_loss:.4f}, CC100-Loss={cc100_loss:.4f}, "
-                f"OWT1M-Loss={owt_loss:.4f}, Pile-Loss={pile_loss:.4f}, "
+                f"OWT1M-Loss={owt_loss:.4f}, {pile_label_name}={pile_loss:.4f}, "
                 f"Balance={per['Expert Balance (entropy)']:.4f}, "
                 f"Prefill tok/s={per['Prefill tokens/s']:.1f}, Decode tok/s={per['Decode tokens/s']:.1f}, "
                 f"Decode ms/tok={per['Decode ms/token']:.2f}, TTFT ms={per['Decode TTFT (ms)']:.1f}"
             )
+
             results[mode] = per
+
         finally:
             if torch.cuda.is_available():
                 try: torch.cuda.synchronize()
@@ -311,6 +344,7 @@ def run_all_tests(batch_size=44, base_num_experts=16):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.ipc_collect()
+
     if results:
         df = pd.DataFrame(results).T
         out = os.path.join(CHECKPOINTS_DIR, "test_results_wt103_cc100_owt_pile.csv")

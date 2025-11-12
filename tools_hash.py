@@ -15,7 +15,7 @@ def create_global_hash_table(num_experts, vocab_size=50257, save_path=None, mt=F
         return save_path
 
     print("--- 🌍 Starting Optimized Hash Table Creation (Full Dataset) ---")
-    train_dataset, _ = (load_or_prepare_mt() if mt else load_or_prepare_pile())
+    train_dataset, _, _ = (load_or_prepare_mt() if mt else load_or_prepare_pile())
     sample_dataset = train_dataset
     print(f"📊 Using the FULL train dataset of {len(sample_dataset):,} documents.")
 
