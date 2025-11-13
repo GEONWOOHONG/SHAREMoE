@@ -59,7 +59,8 @@ def evaluate(model, dataloader, device, show_bar=False, desc="Valid", use_mt=Fal
 
         labels = input_ids.clone()
         if not use_mt:
-            labels[labels == enc.eot_token] = -100
+            pad_mask = (attn == 0) & (labels == enc.eot_token)
+            labels[pad_mask] = -100
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
             logits = model(
@@ -400,7 +401,8 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
 
             labels = input_ids.clone()
             if not mt:
-                labels[labels == enc.eot_token] = -100
+                pad_mask = (attn == 0) & (labels == enc.eot_token)
+                labels[pad_mask] = -100
 
             sync_now = (step % grad_accum) == 0
             ctx = (model.no_sync() if (is_dist and not sync_now) else contextlib.nullcontext())
