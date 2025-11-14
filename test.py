@@ -14,7 +14,7 @@ from datasets import load_dataset
 import pandas as pd
 from contextlib import nullcontext
 
-from data import load_or_prepare_pile, worker_init_fn, get_dataloader_generator
+from data import load_or_prepare_pile, load_pile_test, worker_init_fn, get_dataloader_generator
 from modeling import convert_gpt2_to_moe
 from patches import (
     patch_model_basic,
@@ -141,16 +141,11 @@ def run_all_tests(batch_size=44, base_num_experts=16):
     if torch.cuda.is_available():
         ensure_flash_attn()
 
-    train_ds, pile_valid, pile_test = load_or_prepare_pile(verbose=True)
-
-    if pile_test is not None:
-        pile_test.set_format(type="torch", columns=["input_ids", "attention_mask"])
-        pile_eval = pile_test
-        pile_label_name = "Pile Test Loss"
-    else:
-        pile_valid.set_format(type="torch", columns=["input_ids", "attention_mask"])
-        pile_eval = pile_valid.select(range(int(0.1 * len(pile_valid))))
-        pile_label_name = "Pile Valid Loss"
+    train_ds, pile_valid = load_or_prepare_pile(verbose=True)
+    pile_test = load_pile_test(verbose=True)
+    pile_test.set_format(type="torch", columns=["input_ids", "attention_mask"])
+    pile_eval = pile_test
+    pile_label_name = "Pile Test Loss"
 
     wt = load_or_prepare_wt103()
     wt_test = wt["test"]

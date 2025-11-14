@@ -204,22 +204,15 @@ def run_analysis_A(mode: str = "ours_refine",
         print(f"Layer-Level Analysis (Part A) - Mode: {mode}")
         print(f"{'='*70}")
     
-    # Test 셋 우선 사용, 없으면 validation 사용
-    from data import load_or_prepare_pile, worker_init_fn, get_dataloader_generator
+    # Test 데이터셋 로드
+    from data import load_pile_test, worker_init_fn, get_dataloader_generator
     from torch.utils.data import DataLoader
     
-    train_ds, pile_valid, pile_test = load_or_prepare_pile(verbose=verbose)
-    if pile_test is not None:
-        pile_test.set_format(type="torch", columns=["input_ids", "attention_mask"])
-        eval_ds = pile_test
-        if verbose:
-            print(f"Using test set: {len(pile_test)} samples")
-    else:
-        pile_valid.set_format(type="torch", columns=["input_ids", "attention_mask"])
-        # 기존 동작과 동일하게 validation 일부만 사용
-        eval_ds = pile_valid.select(range(int(sample_fraction * len(pile_valid))))
-        if verbose:
-            print(f"Using validation set (no test available): {len(eval_ds)} samples")
+    pile_test = load_pile_test(verbose=verbose)
+    pile_test.set_format(type="torch", columns=["input_ids", "attention_mask"])
+    eval_ds = pile_test
+    if verbose:
+        print(f"Using test set: {len(pile_test)} samples")
     
     num_workers = min(8, max(2, (os.cpu_count() or 8)//2))
     loader = DataLoader(

@@ -48,10 +48,9 @@ def load_model_safetensors(model: nn.Module, ckpt_path: str, strict: bool=False)
     print(f"Loaded tensors from: {ckpt_path}")
 
 def load_pile_validation_with_source_labels() -> Tuple["datasets.Dataset", Dict[str,int], Dict[int,str]]:
-    train, valid, test = load_or_prepare_pile(verbose=True)
-    # test 우선, 없으면 기존 valid
-    ds = test if test is not None else valid
-    print(f"Building source label mapping from meta.pile_set_name (using {'test' if test is not None else 'validation'} set)")
+    from data import load_pile_test
+    ds = load_pile_test(verbose=True)
+    print(f"Building source label mapping from meta.pile_set_name (using test set)")
     all_sources = set([m["pile_set_name"] for m in ds["meta"]])
     source_to_idx = {name: i for i, name in enumerate(sorted(all_sources))}
     idx_to_source = {i: n for n, i in source_to_idx.items()}

@@ -13,7 +13,6 @@ os.makedirs(os.environ["HF_DATASETS_CACHE"], exist_ok=True)
 import argparse
 from train import train_moe
 from utils import set_seed
-from analysis_expert_mapping import run_mapping_analysis
 from analysis_layers import run_analysis_A
 from analysis_specialization_confidence import run_specialization_confidence
 
@@ -117,7 +116,6 @@ def main():
     an.add_argument("--max_batches", type=int, default=None, help="Maximum number of batches to analyze (None for 10% of total)")
     an.add_argument("--sample_fraction", type=float, default=0.10, help="Fraction of validation batches when max_batches is None")
     an.add_argument("--debug", action="store_true", help="Debug mode: use only 0.1% of validation data for quick testing")
-    an.add_argument("--skip_mapping", action="store_true", help="Skip legacy mapping analysis")
     an.add_argument("--skip_layers", action="store_true", help="Skip layer-level analysis (LEI, CKA, etc.)")
     an.add_argument("--skip_specialization", action="store_true", help="Skip specialization & confidence analysis")
     an.add_argument("--no_flash", action="store_true", help="Disable Flash Attention")
@@ -144,27 +142,9 @@ def main():
         print(f"Debug Mode: {args.debug}")
         print("="*80 + "\n")
         
-        # 1) Legacy mapping analysis (optional backward compatibility)
-        if not args.skip_mapping:
-            print("\n[1/3] Running legacy mapping analysis...")
-            try:
-                debug_max_batches = "debug" if args.debug else max_batches
-                run_mapping_analysis(
-                    batch_size=args.batch_size,
-                    base_num_experts=args.num_experts,
-                    max_batches=debug_max_batches,
-                    run_specialization=True,
-                    run_confidence=True,
-                    run_routes=True,
-                )
-            except Exception as e:
-                print(f"⚠️ Legacy mapping analysis failed: {e}")
-        else:
-            print("\n[1/3] Skipping legacy mapping analysis (--skip_mapping)")
-        
-        # 2) Layer-level analysis (LEI, CKA, Intra-redundancy)
+        # 1) Layer-level analysis (LEI, CKA, Intra-redundancy)
         if not args.skip_layers:
-            print("\n[2/3] Running layer-level analysis (LEI, CKA, etc.)...")
+            print("\n[1/2] Running layer-level analysis (LEI, CKA, etc.)...")
             for mode in modes_list:
                 print(f"\n  → Analyzing mode: {mode}")
                 try:
@@ -180,11 +160,11 @@ def main():
                 except Exception as e:
                     print(f"⚠️ Layer analysis failed for {mode}: {e}")
         else:
-            print("\n[2/3] Skipping layer-level analysis (--skip_layers)")
+            print("\n[1/2] Skipping layer-level analysis (--skip_layers)")
         
-        # 3) Specialization & Confidence analysis
+        # 2) Specialization & Confidence analysis
         if not args.skip_specialization:
-            print("\n[3/3] Running specialization & confidence analysis...")
+            print("\n[2/2] Running specialization & confidence analysis...")
             try:
                 run_specialization_confidence(
                     modes=modes_list,
@@ -198,7 +178,7 @@ def main():
             except Exception as e:
                 print(f"⚠️ Specialization & confidence analysis failed: {e}")
         else:
-            print("\n[3/3] Skipping specialization & confidence analysis (--skip_specialization)")
+            print("\n[2/2] Skipping specialization & confidence analysis (--skip_specialization)")
         
         print("\n" + "="*80)
         print("✅ ANALYSIS COMPLETE")
@@ -235,9 +215,8 @@ if __name__ == "__main__":
 #python run.py analysis --modes switch,ours_refine --sample_fraction 0.05
 
 # Skip specific analyses:
-#python run.py analysis --skip_mapping --modes ours_refine  # only layer + specialization
-#python run.py analysis --skip_layers --modes ours_refine   # only mapping + specialization
-#python run.py analysis --skip_specialization --modes ours_refine  # only mapping + layer
+#python run.py analysis --skip_layers --modes ours_refine   # only specialization
+#python run.py analysis --skip_specialization --modes ours_refine  # only layer
 
 #apt update && apt install -y nano zip unzip && pip install transformers datasets tensorboard pandas tqdm scipy tiktoken safetensors huggingface_hub hf_transfer calflops
 #tensorboard --logdir=/workspace/runs --host=0.0.0.0 --port=6006
