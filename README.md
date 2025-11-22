@@ -1,1 +1,1 @@
-# SHAREMoE
+# G-MoE
