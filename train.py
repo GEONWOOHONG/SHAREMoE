@@ -126,7 +126,7 @@ def compute_moe_stats(model, config, mode):
 def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_accum=1, continue_training=False, mt=False):
     is_dist, rank, world_size, local_rank = init_distributed()
 
-    def is_main(): return (not is_dist) or (rank == 0)
+    is_main = (not is_dist) or (dist.get_rank() == 0)
 
     set_seed(42)
     if is_main():
@@ -135,7 +135,8 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
         dist.barrier()
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     
-    save_dir = f"/workspace/checkpoints/{mode}_exp1"
+    from config import CHECKPOINTS_DIR
+    save_dir = os.path.join(CHECKPOINTS_DIR, f"{mode}_exp1")
     os.makedirs(save_dir, exist_ok=True)
     if is_main():
         print(f"💾 Checkpoint directory: {save_dir}")
@@ -191,6 +192,7 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
             n_embd=768,
             n_layer=12,
             n_head=12,
+            n_inner=3072
         )
         model = GPT2LMHeadModel(config)
         stable_args = dict(stable_routing_dim=50, stable_balance_alpha=0.3)

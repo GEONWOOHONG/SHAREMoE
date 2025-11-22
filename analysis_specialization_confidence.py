@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 from transformers import GPT2Config, GPT2LMHeadModel
 from safetensors.torch import safe_open
 
-from config import CHECKPOINTS_DIR, HF_DATASETS_CACHE, HF_HOME, HASH_TABLE_PATH
+from config import CHECKPOINTS_DIR, HF_DATASETS_CACHE, HF_HOME, HASH_TABLE_PATH, WORKSPACE_ROOT
 from modeling import MoELayer
 from data import load_or_prepare_pile, worker_init_fn, get_dataloader_generator
 from utils import (
@@ -25,8 +25,8 @@ from utils import (
 warnings.filterwarnings("ignore")
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-os.environ.setdefault("HF_HOME", HF_HOME if HF_HOME else "/workspace/hf_cache")
-os.environ.setdefault("HF_DATASETS_CACHE", HF_DATASETS_CACHE if HF_DATASETS_CACHE else "/workspace/hf_cache/datasets")
+os.environ.setdefault("HF_HOME", HF_HOME)
+os.environ.setdefault("HF_DATASETS_CACHE", HF_DATASETS_CACHE)
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.makedirs(os.environ["HF_DATASETS_CACHE"], exist_ok=True)
 

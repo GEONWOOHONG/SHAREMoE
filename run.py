@@ -6,8 +6,11 @@ os.environ.setdefault("HF_DATASETS_VERBOSITY", "warning")
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-os.environ.setdefault("HF_HOME", "/workspace/hf_cache")
-os.environ.setdefault("HF_DATASETS_CACHE", "/workspace/hf_cache/datasets")
+
+# workspace 경로 설정 (config.py에서 가져옴)
+from config import HF_HOME, HF_DATASETS_CACHE
+os.environ.setdefault("HF_HOME", HF_HOME)
+os.environ.setdefault("HF_DATASETS_CACHE", HF_DATASETS_CACHE)
 os.makedirs(os.environ["HF_DATASETS_CACHE"], exist_ok=True)
 
 import argparse
@@ -219,7 +222,7 @@ if __name__ == "__main__":
 #python run.py analysis --skip_specialization --modes ours_refine  # only layer
 
 #apt update && apt install -y nano zip unzip && pip install transformers datasets tensorboard pandas tqdm scipy tiktoken safetensors huggingface_hub hf_transfer calflops
-#tensorboard --logdir=/workspace/runs --host=0.0.0.0 --port=6006
+#tensorboard --logdir=../workspace/runs --host=0.0.0.0 --port=6006
 
 #wget https://github.com/schollz/croc/releases/download/v10.2.5/croc_v10.2.5_Linux-64bit.tar.gz
 #tar xzf croc_v10.2.5_Linux-64bit.tar.gz
