@@ -132,7 +132,7 @@ def make_validation_dataloader(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
-        prefetch_factor=2,
+        prefetch_factor=4,
         persistent_workers=False,
         worker_init_fn=worker_init_fn,
         generator=get_dataloader_generator(0),
