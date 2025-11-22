@@ -39,10 +39,8 @@ def load_or_prepare_pile(cache_path=None, raw_cache=None, verbose=True):
         return ds["train"], ds["validation"]
 
     if verbose and _is_rank0():
-        print(
-            f"🔹 Downloading first {MAX_TRAIN_SHARDS} train shards "
-            f"from {PILE_REPO_ID} (cache_dir={cache_dir_hub})"
-        )
+        print(f"🔹 Downloading first {MAX_TRAIN_SHARDS} train shards "
+              f"from {PILE_REPO_ID} (cache_dir={cache_dir_hub})")
 
     allow_patterns = [
         *(f"train/train.{i:05d}.parquet" for i in range(MAX_TRAIN_SHARDS)),
@@ -66,22 +64,23 @@ def load_or_prepare_pile(cache_path=None, raw_cache=None, verbose=True):
         print(f"  ├─ train shards: {len(train_files)} -> {train_files[0]} ...")
         print(f"  └─ validation files: {len(valid_files)}")
 
-    features = Features({
-        "input_ids": Sequence(Value("int32"), length=1024),
-        "attention_mask": Sequence(Value("int8"), length=1024),
-    })
-
     train_ds = load_dataset(
         "parquet",
         data_files={"train": train_files},
-        features=features,
     )["train"]
 
     valid_ds = load_dataset(
         "parquet",
         data_files={"validation": valid_files},
-        features=features,
     )["validation"]
+
+    features = Features({
+        "input_ids": Sequence(Value("int32"), length=1024),
+        "attention_mask": Sequence(Value("int8"), length=1024),
+    })
+
+    train_ds = train_ds.cast(features)
+    valid_ds = valid_ds.cast(features)
 
     return train_ds, valid_ds
 
