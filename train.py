@@ -228,7 +228,7 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
     else:
         train_dataset, valid_dataset = load_or_prepare_pile(verbose=is_main())
 
-    valid_dataset = valid_dataset.select(range(int(0.01  * len(valid_dataset))))
+    valid_dataset = valid_dataset.select(range(int(0.1  * len(valid_dataset))))
     
     if is_main():
         print(f"Using FULL datasets: train={len(train_dataset):,}, valid={len(valid_dataset):,}")
@@ -239,7 +239,7 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
     logical_cpus = os.cpu_count() or 2
     gpus = (world_size if is_dist else 1)
     computed = max(2, (logical_cpus // gpus) // 2)
-    NUM_WORKERS = min(8, computed)
+    NUM_WORKERS = min(16, computed)
 
     if is_main():
         print(f"🧵 DataLoader workers per GPU: computed={computed} → using={NUM_WORKERS}")
@@ -271,7 +271,7 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
         shuffle=(train_sampler is None),
         sampler=train_sampler,
         num_workers=NUM_WORKERS,
-        prefetch_factor=2,
+        prefetch_factor=8,
         persistent_workers=True,
         worker_init_fn=worker_init_fn,
         generator=train_generator,
@@ -284,7 +284,7 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
         shuffle=False,
         sampler=valid_sampler,
         num_workers=NUM_WORKERS,
-        prefetch_factor=2,
+        prefetch_factor=8,
         persistent_workers=True,
         worker_init_fn=worker_init_fn,
         generator=valid_generator,

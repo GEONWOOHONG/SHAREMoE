@@ -124,7 +124,7 @@ def make_validation_dataloader(
         raise ValueError(f"Unknown dataset_name: {dataset_name}")
     
     if num_workers is None:
-        num_workers = min(8, max(2, (os.cpu_count() or 8) // 2))
+        num_workers = min(16, max(2, (os.cpu_count() or 8) // 2))
     
     loader = DataLoader(
         valid,
@@ -132,7 +132,7 @@ def make_validation_dataloader(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
-        prefetch_factor=16,
+        prefetch_factor=8,
         persistent_workers=False,
         worker_init_fn=worker_init_fn,
         generator=get_dataloader_generator(0),
