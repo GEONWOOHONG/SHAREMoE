@@ -126,7 +126,8 @@ def compute_moe_stats(model, config, mode):
 def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_accum=1, continue_training=False, mt=False):
     is_dist, rank, world_size, local_rank = init_distributed()
 
-    is_main = (not is_dist) or (dist.get_rank() == 0)
+    def is_main():
+        return (not is_dist) or (dist.get_rank() == 0)
 
     set_seed(42)
     if is_main():
