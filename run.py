@@ -205,7 +205,7 @@ if __name__ == "__main__":
     main()
 
 #python run.py train --mode ours_refine --num_experts 4 --batch_size 4 --seq_len 1024 --grad_accum 2
-#torchrun --nproc_per_node=8 --master_port=29600 run.py train --mode ours_refine --num_experts 16 --batch_size 64 --seq_len 1024 --grad_accum 1
+#torchrun --nproc_per_node=8 --master_port=29600 run.py train --mode switch --num_experts 16 --batch_size 64 --seq_len 1024 --grad_accum 1
 #python run.py eval --batch_size 44 --num_experts 16
 
 # Full analysis (all modes, all metrics):
