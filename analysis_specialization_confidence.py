@@ -134,10 +134,24 @@ def accumulate_specialization_and_confidence(per_layer: List[Dict[str, torch.Ten
                                              stats_conf_by_source: Dict,
                                              token_nll: Optional[torch.Tensor] = None):
     B, S = pile_set_ids.shape
-    token_sources = pile_set_ids[:, :-1].reshape(-1).cpu().tolist()
+
+    token_sources_all = pile_set_ids.reshape(-1).cpu().tolist()
+
     nll_flat = None
+    valid_idx = None
     if token_nll is not None:
+        # forward_with_token_nll 에서 나온 [B, S-1]
         nll_flat = token_nll.reshape(-1).float().cpu().numpy()
+
+        mask = torch.zeros(B, S, dtype=torch.bool)
+        mask[:, 1:] = True
+        valid_idx = torch.nonzero(mask.view(-1), as_tuple=False).view(-1).cpu().numpy()
+
+        if len(nll_flat) != len(valid_idx):
+            L = min(len(nll_flat), len(valid_idx))
+            nll_flat = nll_flat[:L]
+            valid_idx = valid_idx[:L]
+
     layer_idx = -1
     for entry in per_layer:
         layer_idx += 1
@@ -146,41 +160,75 @@ def accumulate_specialization_and_confidence(per_layer: List[Dict[str, torch.Ten
         top1_prob = entry.get("top1_prob", None)
         if probs is None and top1 is None:
             continue
+
         if probs is not None:
-            N = probs.size(0)
-            expert_ids = torch.argmax(probs, dim=-1).cpu().tolist()
-            max_probs = top1_prob.cpu().numpy()
+            # probs: [N_tokens, N_experts] or [B, S, N_experts]
+            probs_flat = probs.view(-1, probs.size(-1))
+            expert_ids_all = torch.argmax(probs_flat, dim=-1).cpu().tolist()
+
+            if top1_prob is not None:
+                max_probs_all = top1_prob.view(-1).float().cpu().numpy()
+            else:
+                max_probs_all = np.full(len(expert_ids_all), np.nan, dtype=np.float32)
+
             std_m = entry.get("std_margin", None)
             nH = entry.get("norm_entropy", None)
             z_p1 = entry.get("z_top1_prob", None)
-            if std_m is not None:
-                std_m = std_m.view(-1).cpu().numpy()
-            if nH is not None:
-                nH = nH.view(-1).cpu().numpy()
-            if z_p1 is not None:
-                z_p1 = z_p1.view(-1).cpu().numpy()
+
+            std_m_all = std_m.view(-1).cpu().numpy() if std_m is not None else None
+            nH_all = nH.view(-1).cpu().numpy() if nH is not None else None
+            z_p1_all = z_p1.view(-1).cpu().numpy() if z_p1 is not None else None
         else:
-            expert_ids = top1.view(-1).cpu().tolist()
-            max_probs = np.array([np.nan for _ in expert_ids], dtype=np.float32)
-            std_m = nH = z_p1 = None
+            top1_flat = top1.view(-1)
+            expert_ids_all = top1_flat.cpu().tolist()
+            max_probs_all = np.full(len(expert_ids_all), np.nan, dtype=np.float32)
+            std_m_all = nH_all = z_p1_all = None
+
+        N_all = min(len(token_sources_all), len(expert_ids_all))
+        expert_ids_all = expert_ids_all[:N_all]
+        max_probs_all = max_probs_all[:N_all]
+        if std_m_all is not None:
+            std_m_all = std_m_all[:N_all]
+        if nH_all is not None:
+            nH_all = nH_all[:N_all]
+        if z_p1_all is not None:
+            z_p1_all = z_p1_all[:N_all]
+        token_sources_all_use = token_sources_all[:N_all]
+
         c = stats_spec[layer_idx]
-        for eid, sid in zip(expert_ids, token_sources):
+        for eid, sid in zip(expert_ids_all, token_sources_all_use):
             c[eid][sid] += 1
-        cc = stats_conf[layer_idx]
-        cc.setdefault("top1_probs", []).extend(max_probs.tolist())
-        cc.setdefault("expert_choices", []).extend(expert_ids)
-        if std_m is not None:
-            cc.setdefault("std_margin", []).extend(std_m.tolist())
-        if nH is not None:
-            cc.setdefault("norm_entropy", []).extend(nH.tolist())
-        if z_p1 is not None:
-            cc.setdefault("z_top1_prob", []).extend(z_p1.tolist())
-        if nll_flat is not None:
-            cc.setdefault("token_nll", []).extend(nll_flat.tolist())
+
         cs = stats_conf_by_source[layer_idx]
-        for p, eid, sid in zip(max_probs, expert_ids, token_sources):
+        for p, eid, sid in zip(max_probs_all, expert_ids_all, token_sources_all_use):
             if not np.isnan(p):
                 cs[eid][sid].append(float(p))
+
+        cc = stats_conf[layer_idx]
+        if nll_flat is not None and valid_idx is not None and len(valid_idx) > 0:
+            valid_idx_clipped = [int(i) for i in valid_idx if i < N_all]
+            if not valid_idx_clipped:
+                continue
+
+            L = min(len(valid_idx_clipped), len(nll_flat))
+            if L == 0:
+                continue
+            valid_idx_clipped = valid_idx_clipped[:L]
+
+            expert_ids_nll = [expert_ids_all[i] for i in valid_idx_clipped]
+            max_probs_nll = max_probs_all[valid_idx_clipped]
+
+            cc.setdefault("expert_choices", []).extend(expert_ids_nll)
+            cc.setdefault("top1_probs", []).extend(max_probs_nll.tolist())
+
+            if std_m_all is not None:
+                cc.setdefault("std_margin", []).extend(std_m_all[valid_idx_clipped].tolist())
+            if nH_all is not None:
+                cc.setdefault("norm_entropy", []).extend(nH_all[valid_idx_clipped].tolist())
+            if z_p1_all is not None:
+                cc.setdefault("z_top1_prob", []).extend(z_p1_all[valid_idx_clipped].tolist())
+
+            cc.setdefault("token_nll", []).extend(nll_flat[:L].tolist())
 
 def finalize_specialization_tables(stats_spec: Dict,
                                    idx_to_source: Dict[int, str],
@@ -480,18 +528,15 @@ def run_specialization_confidence(
                     per_layer = analyze_batch_collect(model, input_ids, mask)
                     token_nll = forward_with_token_nll(model, input_ids, mask)
             
-            for entry in per_layer:
-                if entry.get("probs") is None:
-                    continue
-                for k in ["probs", "top1", "top1_prob", "std_margin", "norm_entropy", "z_top1_prob"]:
-                    if entry.get(k) is not None:
-                        t = entry[k]
-                        if t.dim() == 2:
-                            entry[k] = t[:, :-1]
-                        elif t.dim() == 3:
-                            entry[k] = t[:, :-1, :]
+            accumulate_specialization_and_confidence(
+                per_layer,
+                pile_set_ids,
+                stats_spec,
+                stats_conf,
+                stats_conf_by_source,
+                token_nll,
+            )
             
-            accumulate_specialization_and_confidence(per_layer, pile_set_ids, stats_spec, stats_conf, stats_conf_by_source, token_nll)
             processed += 1
             if verbose and processed % 10 == 0:
                 print(f"Processed {processed}/{max_batches} batches")

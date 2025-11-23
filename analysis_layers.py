@@ -1,4 +1,4 @@
-import os, json, math, time, collections, re
+import os, json, time, collections, re
 from typing import Dict, List, Tuple, Optional
 
 import numpy as np
@@ -13,7 +13,6 @@ from utils import (
     build_model_for_mode,
     load_checkpoint_if_exists,
 )
-from data import make_validation_dataloader
 from modeling import MoELayer
 from transformers import GPT2Config
 
@@ -192,7 +191,6 @@ def run_analysis_A(mode: str = "ours_refine",
                    seq_len: int = 1024,
                    max_batches: Optional[int] = None,
                    save_json: Optional[str] = None,
-                   sample_fraction: float = 0.10,
                    use_flash_attn: bool = True,
                    verbose: bool = True):
     assert mode in {"dense","switch","gshard","hash","ours_refine"}, f"Unsupported mode: {mode}"
@@ -222,9 +220,13 @@ def run_analysis_A(mode: str = "ours_refine",
         worker_init_fn=worker_init_fn, generator=get_dataloader_generator(0)
     )
     total_batches = len(loader)
-    effective_batches = total_batches if max_batches is None else min(max_batches, total_batches)
-    if max_batches is None and verbose:
-        print(f"Using approximately {sample_fraction*100:.0f}% of eval: {effective_batches}/{total_batches} batches")
+    if max_batches is None:
+        effective_batches = total_batches
+    else:
+        effective_batches = min(max_batches, total_batches)
+
+    if verbose:
+        print(f"Using {effective_batches}/{total_batches} eval batches")
     config = GPT2Config(vocab_size=50257, n_positions=1024, n_ctx=1024, n_embd=1024, n_layer=8, n_head=8)
     model = build_model_for_mode(mode, num_experts=num_experts, config=config)
     load_checkpoint_if_exists(model, mode, CHECKPOINTS_DIR, strict=False)
@@ -280,7 +282,6 @@ if __name__ == "__main__":
     ap.add_argument("--seq_len", type=int, default=1024)
     ap.add_argument("--max_batches", type=int, default=None)
     ap.add_argument("--save_json", type=str, default=None)
-    ap.add_argument("--sample_fraction", type=float, default=0.10)
     ap.add_argument("--no_flash", action="store_true")
     args = ap.parse_args()
     run_analysis_A(
@@ -290,6 +291,5 @@ if __name__ == "__main__":
         seq_len=args.seq_len,
         max_batches=args.max_batches,
         save_json=args.save_json,
-        sample_fraction=args.sample_fraction,
         use_flash_attn=not args.no_flash,
     )
