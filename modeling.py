@@ -413,12 +413,13 @@ class MoELayer(nn.Module):
 
             assert shared_router is not None, "ours_refine requires a shared_router"
             self.shared_router = shared_router
-
+            self.h_ln = nn.LayerNorm(self.shared_router.gru.hidden_size)
+            
             self.cond_dim = self.shared_router.gru.hidden_size
             self.score_dim = self.num_experts
             self.prev_score_ln = nn.LayerNorm(self.score_dim)
             self.prev_score_proj = nn.Linear(self.score_dim, self.cond_dim, bias=False)
-            self.gate_head = nn.Linear(self.cond_dim + self.cond_dim, self.score_dim)
+            self.gate_head = nn.Linear(self.cond_dim + self.cond_dim, self.score_dim, bias=False)
             self.last_scores = None
 
         elif mode == "hash":
