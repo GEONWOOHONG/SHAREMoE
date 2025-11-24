@@ -105,14 +105,16 @@ def main():
     tr.add_argument("--continue_training", action="store_true")
     tr.add_argument("--mt", action="store_true")
     tr.add_argument("--ablate_local", action="store_true")
-
+    tr.add_argument("--ablate_global", action="store_true")
+    
     ev = sub.add_parser("eval")
     ev.add_argument("--mode", default="switch")
     ev.add_argument("--num_experts", type=int, default=16)
     ev.add_argument("--batch_size", type=int, default=44)
     ev.add_argument("--seq_len", type=int, default=1024)
     ev.add_argument("--ablate_local", action="store_true")
-                    
+    ev.add_argument("--ablate_global", action="store_true")
+           
     an = sub.add_parser("analysis")
     an.add_argument("--modes", type=str, default="switch,gshard,hash,ours_refine", help="Comma-separated mode list")
     an.add_argument("--num_experts", type=int, default=16)
@@ -199,6 +201,7 @@ def main():
             continue_training=args.continue_training,
             mt=args.mt,
             ablate_local=args.ablate_local,
+            ablate_global=args.ablate_global,
         )
     elif args.cmd == "eval":
         from test import run_all_tests
@@ -206,6 +209,7 @@ def main():
             batch_size=args.batch_size,
             base_num_experts=args.num_experts,
             ablate_local=args.ablate_local,
+            ablate_global=args.ablate_global,
         )
 
 if __name__ == "__main__":

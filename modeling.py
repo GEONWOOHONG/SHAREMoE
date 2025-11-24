@@ -341,7 +341,8 @@ class MoELayer(nn.Module):
                  xmoe_threshold: float = 0.90,
                  xmoe_capacity_factor: float = 1.0,
                  xmoe_expert_mult: float = 0.25,
-                 ablate_local=False,
+                 ablate_local: bool = False,
+                 ablate_global: bool = False,
                  vocab_size: int = 50257):
         super().__init__()
         self.vocab_size = int(vocab_size) 
@@ -354,7 +355,11 @@ class MoELayer(nn.Module):
         self.last_scores = None
         self.aux_alpha = alpha
         self.last_aux = {"balance": None, "distill": None, "overflow_rate": None}
-        self.ablate_local = ablate_local
+        self.ablate_local = bool(ablate_local)
+        self.ablate_global = bool(ablate_global)
+
+        if self.ablate_local and self.ablate_global:
+            raise ValueError("ablate_local and ablate_global cannot both be True.")
 
         if mode == "xmoe":
             d_ff_expert = max(64, int(d_model * 4 * xmoe_expert_mult))
@@ -391,20 +396,29 @@ class MoELayer(nn.Module):
                 self.proj_gamma_beta = nn.Linear(self.cond_dim, d_model, bias=False)
 
         elif mode == "ours_refine":
-            self.experts = nn.ModuleList([Expert(d_model, d_ff) for _ in range(1)])
-            self.num_experts = len(global_experts)
+            if self.ablate_global:
+                if num_experts < 2:
+                    raise ValueError("ours_refine with ablate_global requires at least 1 local + 1 routed expert.")
+                self.num_experts = num_experts - 1
+                self.experts = nn.ModuleList(
+                    [Expert(d_model, d_ff) for _ in range(num_experts)]
+                )
+                self.global_experts = None
+            else:
+                self.experts = nn.ModuleList([Expert(d_model, d_ff) for _ in range(1)])
+                if global_experts is None:
+                    raise ValueError("ours_refine requires global_experts when ablate_global=False")
+                self.num_experts = len(global_experts)
+                self.global_experts = global_experts
+
             assert shared_router is not None, "ours_refine requires a shared_router"
             self.shared_router = shared_router
 
             self.cond_dim = self.shared_router.gru.hidden_size
             self.score_dim = self.num_experts
-            self.h_ln = nn.LayerNorm(self.cond_dim)
-
-            self.prev_score_ln   = nn.LayerNorm(self.score_dim)
+            self.prev_score_ln = nn.LayerNorm(self.score_dim)
             self.prev_score_proj = nn.Linear(self.score_dim, self.cond_dim, bias=False)
-
-            self.gate_head = nn.Linear(self.cond_dim * 2, self.num_experts, bias=False)
-
+            self.gate_head = nn.Linear(self.cond_dim + self.cond_dim, self.score_dim)
             self.last_scores = None
 
         elif mode == "hash":
@@ -676,17 +690,22 @@ class MoELayer(nn.Module):
             return routed_out, aux_loss, h_new
 
         elif self.mode == "ours_refine":
-            h_new = self.shared_router(x, h_prev=(routing_state["h"] if isinstance(routing_state, dict) else routing_state))
-            h_feat = self.h_ln(h_new)
+            if isinstance(routing_state, dict) and ("h" in routing_state) and (routing_state["h"] is not None):
+                h_prev = routing_state["h"]
+            else:
+                h_prev = None
+
+            h_new = self.shared_router(x, h_prev=h_prev)
+            h_feat = h_new.view(-1, h_new.size(-1))
 
             if getattr(self, "ablate_local", False):
                 N = h_feat.size(0)
-
-                if isinstance(routing_state, dict) and ("logits" in routing_state) and (routing_state["logits"] is not None):
-                    prev_logits = routing_state["logits"].to(h_feat.dtype)
-                else:
-                    prev_logits = h_feat.new_zeros((N, self.score_dim))
-
+                prev_logits = (
+                    routing_state.get("logits").to(h_feat.dtype)
+                    if isinstance(routing_state, dict)
+                    and routing_state.get("logits") is not None
+                    else h_feat.new_zeros((N, self.score_dim))
+                )
                 prev_feat = self.prev_score_proj(self.prev_score_ln(prev_logits))
                 gate_in = torch.cat([h_feat, prev_feat], dim=-1)
 
@@ -694,49 +713,103 @@ class MoELayer(nn.Module):
                 scores = F.softmax(logits, dim=-1)
                 self.last_scores = scores.detach()
 
-                top_scores, top_idx = torch.topk(scores, k=2, dim=-1)
-
                 B, T, H = x.shape
                 x_flat = x.view(-1, H)
+                topk = min(2, self.num_experts)
+                top_prob, top_idx = torch.topk(scores, k=topk, dim=-1)
+
+                cap = int(self.capacity_factor * (x_flat.size(0) / self.num_experts))
+                ZERO_OUT_DROPPED = True
                 out_flat = torch.zeros_like(x_flat)
 
-                capacity = int(self.capacity_factor * math.ceil(x_flat.size(0) * 2 / self.num_experts))
-                if (not self.training) and (not STRICT_CAPACITY_IN_EVAL):
-                    capacity = x_flat.size(0)
+                top_idx_tok  = top_idx.view(-1, topk)
+                top_prob_tok = top_prob.view(-1, topk)
 
-                for r in range(2):
-                    idx_e = top_idx[:, r]
-                    score_e = top_scores[:, r]
+                for e in range(self.num_experts):
+                    mask_e = (top_idx_tok == e)
+                    if not mask_e.any():
+                        continue
 
-                    for eid in range(len(self.global_experts)):
-                        tok = (idx_e == eid).nonzero(as_tuple=True)[0]
-                        if tok.numel() == 0:
-                            continue
+                    idx = mask_e.any(dim=-1).nonzero(as_tuple=True)[0]
 
-                        tok_keep = tok[:capacity]
-                        dropped = tok[capacity:]
+                    if cap is not None and idx.numel() > cap:
+                        if ZERO_OUT_DROPPED:
+                            idx = idx[:cap]
+                    if idx.numel() == 0:
+                        continue
 
-                        if tok_keep.numel() > 0:
-                            y = self.global_experts[eid](x_flat[tok_keep]) * score_e[tok_keep].unsqueeze(-1)
-                            out_flat[tok_keep] += y.to(out_flat.dtype)
+                    gate_e = (top_prob_tok[idx] * mask_e[idx].float()).sum(dim=-1, keepdim=True)  # (n_e, 1)
 
-                        if dropped.numel() > 0:
-                            if ZERO_OUT_DROPPED:
-                                out_flat[dropped].zero_()
-                            else:
-                                out_flat[dropped] = x_flat[dropped]
+                    y = self.global_experts[e](x_flat[idx]) * gate_e
+                    out_flat[idx] = out_flat[idx] + y.to(out_flat.dtype)
 
                 routed_out = out_flat.view(B, T, H)
 
                 aux_loss = None
                 if self.training and getattr(self, "aux_alpha", 0.01) > 0.0:
-                    one_hot = torch.nn.functional.one_hot(top_idx.view(-1), num_classes=self.num_experts).float()
-                    freq = one_hot.mean(0)
-                    Pi   = scores.mean(0)
-                    fi   = freq * self.num_experts
+                    top_idx_flat = top_idx.view(-1)
+                    one_hot = F.one_hot(top_idx_flat, num_classes=self.num_experts)
+                    freq = one_hot.float().mean(0)
+                    Pi = scores.mean(0)
+                    fi = freq * self.num_experts
                     aux_loss = (Pi * fi).sum() * self.aux_alpha
 
                 updated_routing_state = {"h": h_new, "logits": logits.detach()}
+
+                return routed_out, aux_loss, updated_routing_state
+
+            elif getattr(self, "ablate_global", False):
+                N = h_feat.size(0)
+
+                prev_logits = (
+                    routing_state.get("logits").to(h_feat.dtype)
+                    if isinstance(routing_state, dict)
+                    and routing_state.get("logits") is not None
+                    else h_feat.new_zeros((N, self.score_dim))
+                )
+                prev_feat = self.prev_score_proj(self.prev_score_ln(prev_logits))
+                gate_in = torch.cat([h_feat, prev_feat], dim=-1)
+
+                logits = self.gate_head(gate_in)
+                scores = F.softmax(logits, dim=-1)
+                self.last_scores = scores.detach()
+
+                B, T, H = x.shape
+                local_out = self.experts[0](x)
+
+                top_scores, top_idx = torch.topk(scores, k=1, dim=-1)  # [B,T,1], [B,T,1]
+
+                x_flat = x.view(-1, H)
+                out_flat = torch.zeros_like(x_flat)
+
+                top_idx_flat = top_idx.view(-1)
+                top_scores_flat = top_scores.view(-1, 1)
+
+                for eid in range(self.num_experts):
+                    idx = (top_idx_flat == eid).nonzero(as_tuple=True)[0]
+                    if idx.numel() == 0:
+                        continue
+                    expert = self.experts[1 + eid]
+                    y = expert(x_flat[idx]) * top_scores_flat[idx]
+                    out_flat[idx] = y.to(out_flat.dtype)
+
+                routed_pool = out_flat.view(B, T, H)
+                routed_out = local_out + routed_pool
+
+                aux_loss = None
+                if self.training and getattr(self, "aux_alpha", 0.01) > 0.0:
+                    one_hot = F.one_hot(top_idx_flat, num_classes=self.num_experts)
+                    freq = one_hot.float().mean(0)
+                    Pi = scores.mean(0)
+                    fi = freq * self.num_experts
+                    aux_loss = (Pi * fi).sum() * self.aux_alpha
+
+                updated_routing_state = {"h": h_new, "logits": logits.detach()}
+
+                alpha = getattr(self, "ddp_probe_alpha", 1e-8)
+                probe = self._ddp_probe_loss(dtype=x.dtype, device=x.device, alpha=alpha)
+                if probe is not None:
+                    aux_loss = (aux_loss if aux_loss is not None else 0.0) + probe
 
                 return routed_out, aux_loss, updated_routing_state
 
@@ -1011,7 +1084,8 @@ class GPT2LayerMoE(nn.Module):
                  xmoe_capacity_factor: float = 1.0,
                  xmoe_expert_mult: float = 0.25,
                  hypermoe_kwargs: dict | None = None,
-                 ablate_local: bool = False):
+                 ablate_local: bool = False,
+                 ablate_global: bool = False):
         super().__init__()
         self.mode = mode
         self.moe = MoELayer(
@@ -1030,6 +1104,7 @@ class GPT2LayerMoE(nn.Module):
             xmoe_expert_mult=xmoe_expert_mult,
             vocab_size=getattr(config, "vocab_size", 50257),
             ablate_local=ablate_local,
+            ablate_global=ablate_global,
         )
         self.layer_idx = 0 if layer_idx is None else int(layer_idx)
         setattr(self.moe, "_layer_idx", self.layer_idx)
@@ -1122,6 +1197,7 @@ def convert_gpt2_to_moe(
     capacity_factor=1.25,
     freq_dict=None,
     ablate_local: bool = False,
+    ablate_global: bool = False,
     xmoe_threshold=0.90,
     xmoe_capacity_factor=1.0,
     xmoe_expert_mult=0.25,
@@ -1170,13 +1246,21 @@ def convert_gpt2_to_moe(
         layer_experts = 1
 
     if mode == "ours_refine":
-        assert num_experts >= 2, "ours_refine requires at least 2 experts (1 local + N global)."
-        global_experts = nn.ModuleList([
-            Expert(config.n_embd, config.n_embd * 4, initializer_range=config.initializer_range)
-            for _ in range(num_experts - 1)
-        ])
-        shared_router = RecurrentRouter(d_model=config.n_embd, hidden_dim=config.n_embd)
-        layer_experts = 1
+        assert num_experts >= 2, "ours_refine requires at least 1 local + 1 global/routed expert"
+
+        if ablate_global:
+            # global_experts 안 쓰고 per-layer pool을 쓸 거라 None 유지
+            global_experts = None
+            # per-layer experts = 1 local + (num_experts-1) routed
+            layer_experts = num_experts
+        else:
+            # 기존 ours_refine: global_experts 공유 + per-layer local 1개
+            global_experts = nn.ModuleList(
+                [Expert(config.n_embd, config.n_embd * 4) for _ in range(num_experts - 1)]
+            )
+            layer_experts = 1
+
+        shared_router = RecurrentRouter(d_model=config.n_embd, hidden_dim=num_experts - 1)
 
     if mode == "xmoe":
         if xmoe_capacity_factor is None:
@@ -1242,6 +1326,7 @@ def convert_gpt2_to_moe(
                 shared_router=shared_router,
                 layer_idx=i,
                 ablate_local=ablate_local,
+                ablate_global=ablate_global,
             )
 
         elif mode == "hypermoe":

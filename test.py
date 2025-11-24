@@ -136,7 +136,9 @@ def measure_decode_throughput(model, prompt_ids, gen_len=50, dtype=torch.bfloat1
         "Decode_gen": int(gen_len)
     }
 
-def run_all_tests(batch_size=44, base_num_experts=16, ablate_local: bool = False):
+def run_all_tests(batch_size=44, base_num_experts=16,
+                  ablate_local: bool = False,
+                  ablate_global: bool = False):
     set_seed(42)
     if torch.cuda.is_available():
         ensure_flash_attn()
@@ -235,8 +237,10 @@ def run_all_tests(batch_size=44, base_num_experts=16, ablate_local: bool = False
                     vocab_size=50257, n_positions=1024, n_ctx=1024,
                     n_embd=1024, n_layer=8, n_head=8
                 )
-            cfg_ablate = bool(getattr(config, "ablate_local", False))
-
+                
+            cfg_ablate_local = bool(getattr(config, "ablate_local", False))
+            cfg_ablate_global = bool(getattr(config, "ablate_global", False))
+            
             model = GPT2LMHeadModel(config)
 
             if mode != "dense":
@@ -259,12 +263,17 @@ def run_all_tests(batch_size=44, base_num_experts=16, ablate_local: bool = False
                 if mode == "stablemoe":
                     extra.update(dict(stable_routing_dim=50, stable_balance_alpha=0.3))
 
-                use_ablate = cfg_ablate or (ablate_local and mode == "ours_refine")
-                
+                use_ablate_local = cfg_ablate_local or (ablate_local and mode == "ours_refine")
+                use_ablate_global = cfg_ablate_global or (ablate_global and mode == "ours_refine")
+
+                if use_ablate_local and use_ablate_global:
+                    raise ValueError("Both local and global ablation requested for ours_refine.")
+
                 model = convert_gpt2_to_moe(
                     model, config, mode=mode,
                     num_experts=eff_num_experts, alpha=0.01,
-                    ablate_local=use_ablate,
+                    ablate_local=use_ablate_local,
+                    ablate_global=use_ablate_global,
                     **extra,
                 )
 

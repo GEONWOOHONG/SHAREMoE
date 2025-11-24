@@ -128,6 +128,7 @@ def train_moe(
     batch_size=32, seq_len=1024, grad_accum=1,
     continue_training=False, mt=False,
     ablate_local: bool = False,
+    ablate_global: bool = False,
 ):
     is_dist, rank, world_size, local_rank = init_distributed()
 
@@ -184,8 +185,10 @@ def train_moe(
             mode=mode,
             num_experts=eff_num_experts,
             alpha=0.01,
+            capacity_factor=1.25,
             freq_dict=freq_dict,
             ablate_local=ablate_local,
+            ablate_global=ablate_global,
         )
         best_ckpt = os.path.join(save_dir, "best_checkpoint.safetensors")
         trainer_path = os.path.join(save_dir, "best_checkpoint_trainer.pt")
@@ -215,6 +218,7 @@ def train_moe(
             alpha=0.01,
             freq_dict=freq_dict,
             ablate_local=ablate_local,
+            ablate_global=ablate_global,
             **(stable_args if mode == "stablemoe" else {})
         )
 
@@ -315,6 +319,7 @@ def train_moe(
     if is_main():
         config.loss_type = "ForCausalLMLoss"
         config.ablate_local = bool(ablate_local)
+        config.ablate_global = bool(ablate_global)
         config.save_pretrained(save_dir)
 
     model.to(device)
