@@ -15,6 +15,7 @@ def load_safetensors(model, path: str, *, mode: str = "switch", strict: bool = T
     sd = model.state_dict()
     mk = set(sd.keys())
     loaded = []
+    loaded_set = set()
 
     with safe_open(path, framework="pt", device=device_ctx) as f:
         ck = set(f.keys())
@@ -23,7 +24,9 @@ def load_safetensors(model, path: str, *, mode: str = "switch", strict: bool = T
             if k in mk:
                 try:
                     sd[k].copy_(f.get_tensor(k))
-                    loaded.append(k)
+                    if k not in loaded_set:
+                        loaded.append(k)
+                        loaded_set.add(k)
                 except Exception:
                     pass
 
@@ -56,7 +59,9 @@ def load_safetensors(model, path: str, *, mode: str = "switch", strict: bool = T
                         if tgt_k in mk:
                             try:
                                 sd[tgt_k].copy_(f.get_tensor(src_k))
-                                loaded.append(tgt_k)
+                                if tgt_k not in loaded_set:
+                                    loaded.append(tgt_k)
+                                    loaded_set.add(tgt_k)
                                 copied += 1
                             except Exception:
                                 pass
@@ -90,26 +95,36 @@ def load_safetensors(model, path: str, *, mode: str = "switch", strict: bool = T
                         if tgt_k in mk:
                             try:
                                 sd[tgt_k].copy_(f.get_tensor(src_k))
-                                loaded.append(tgt_k)
+                                if tgt_k not in loaded_set:
+                                    loaded.append(tgt_k)
+                                    loaded_set.add(tgt_k)
                                 copied += 1
                             except Exception:
                                 pass
                 if _is_rank0():
                     print(f"ours_com/refine: global_experts params replicated to all layers (copied={copied})")
 
-        if "transformer.wte.weight" in mk and "transformer.wte.weight" not in loaded and "lm_head.weight" in ck:
+        if "transformer.wte.weight" in mk and "transformer.wte.weight" not in loaded_set and "lm_head.weight" in ck:
             if _is_rank0():
                 print("🔗 Tying: lm_head.weight -> transformer.wte.weight")
             try:
                 sd["transformer.wte.weight"].copy_(f.get_tensor("lm_head.weight"))
                 loaded.append("transformer.wte.weight")
+                loaded_set.add("transformer.wte.weight")
             except Exception:
                 pass
 
-    missing = [k for k in mk if k not in loaded]
+    missing = [k for k in mk if k not in loaded_set]
     extra   = [k for k in ck if k not in mk]
+
     if _is_rank0():
-        print(f"📦 Loaded {len(loaded)}/{len(mk)} tensors from checkpoint: {os.path.basename(path)}")
+        total_model = len(mk)
+        total_ckpt  = len(ck)
+        unique_loaded = len(loaded_set)
+        copy_ops = len(loaded)
+        print(f"🔹 Tensors: model={total_model}, checkpoint={total_ckpt}")
+        print(f"📦 Loaded {unique_loaded}/{total_model} tensors from checkpoint "
+              f"({copy_ops} copy ops incl. shared copies): {os.path.basename(path)}")
         if missing and not strict:
             print(f"… Missing {len(missing)} keys (kept random init)")
         if extra and strict:

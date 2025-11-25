@@ -1250,18 +1250,17 @@ def convert_gpt2_to_moe(
         assert num_experts >= 2, "ours_refine requires at least 1 local + 1 global/routed expert"
 
         if ablate_global:
-            # global_experts 안 쓰고 per-layer pool을 쓸 거라 None 유지
             global_experts = None
-            # per-layer experts = 1 local + (num_experts-1) routed
             layer_experts = num_experts
+            shared_router = RecurrentRouter(d_model=config.n_embd, hidden_dim=config.n_embd)
         else:
-            # 기존 ours_refine: global_experts 공유 + per-layer local 1개
-            global_experts = nn.ModuleList(
-                [Expert(config.n_embd, config.n_embd * 4) for _ in range(num_experts - 1)]
-            )
+            # 기존 ours_refine
+            global_experts = nn.ModuleList([
+                Expert(config.n_embd, config.n_embd * 4, initializer_range=config.initializer_range)
+                for _ in range(num_experts - 1)
+            ])
             layer_experts = 1
-
-        shared_router = RecurrentRouter(d_model=config.n_embd, hidden_dim=num_experts - 1)
+            shared_router = RecurrentRouter(d_model=config.n_embd, hidden_dim=config.n_embd)
 
     if mode == "xmoe":
         if xmoe_capacity_factor is None:
