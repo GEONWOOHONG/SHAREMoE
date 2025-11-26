@@ -158,8 +158,45 @@ def train_moe(
     if is_main():
         if mode == "xmoe" and eff_num_experts != num_experts:
             print(f"🧮 xmoe mode: num_experts overridden {num_experts} → {eff_num_experts} (×4)")
-        if mode in ("ours_com", "ours_refine"):
-            print(f"🧮 ours mode: globals={num_experts}, total_passed={eff_num_experts} (=globals+1 local)")
+
+        if mode == "ours_com":
+            print(
+                f"🧮 ours_com: globals={num_experts}, locals=1, "
+                f"total_experts={eff_num_experts} (=globals+1 local)"
+            )
+
+        elif mode == "ours_refine":
+            if ablate_local:
+                n_globals = num_experts
+                n_locals  = 0
+                total     = n_globals
+
+                print(
+                    f"🧮 ours_refine (ablate_local): "
+                    f"globals={n_globals}, locals={n_locals}, "
+                    f"total_passed={total} (local expert disabled)"
+                )
+
+            elif ablate_global:
+                n_globals = 0
+                n_locals  = eff_num_experts
+                total     = n_locals
+
+                print(
+                    f"🧮 ours_refine (ablate_global): "
+                    f"globals={n_globals}, locals={n_locals}, "
+                    f"total_passed={total} (no shared global experts)"
+                )
+
+            else:
+                n_globals = num_experts
+                n_locals  = 1
+                total     = eff_num_experts
+
+                print(
+                    f"🧮 ours_refine: globals={n_globals}, locals={n_locals}, "
+                    f"total_passed={total} (=globals+1 local)"
+                )
     
     vocab_size = 32000 if mt else 50257
     freq_dict = None
