@@ -1,5 +1,6 @@
 #train.py
 import os, math, torch, tiktoken, shutil, contextlib
+from datetime import timedelta
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
@@ -32,9 +33,8 @@ from torch.utils.tensorboard import SummaryWriter
 enc = tiktoken.get_encoding("gpt2")
 
 def init_distributed():
-    """torchrun 환경이면 DDP 초기화하고 (is_dist, rank, world_size, local_rank) 반환"""
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        dist.init_process_group(backend="nccl")
+        dist.init_process_group(backend="nccl", timeout=timedelta(hours=6)) 
         local_rank = int(os.environ["LOCAL_RANK"])
         torch.cuda.set_device(local_rank)
         return True, dist.get_rank(), dist.get_world_size(), local_rank
