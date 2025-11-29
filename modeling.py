@@ -853,13 +853,10 @@ class MoELayer(nn.Module):
             elif getattr(self, "ablate_global", False):
                 N = h_feat.size(0)
 
-                # Ablation Logic 적용
                 if self.ablate_logit_prog:
-                    # Logit Propagation 제거: GRU feature만 사용
                     gate_in = h_feat
                     logits = self.gate_head(gate_in)
                 else:
-                    # 기존 로직: Logit Propagation 사용
                     prev_logits = (
                         routing_state.get("logits").to(h_feat.dtype)
                         if isinstance(routing_state, dict)
@@ -913,13 +910,10 @@ class MoELayer(nn.Module):
 
             N = h_feat.size(0)
             
-            # Ablation Logic 적용
             if self.ablate_logit_prog:
-                # Logit Propagation 제거: GRU feature만 사용
                 gate_in = h_feat
                 logits = self.gate_head(gate_in)
             else:
-                # 기존 로직: Logit Propagation 사용
                 if isinstance(routing_state, dict) and ("logits" in routing_state) and (routing_state["logits"] is not None):
                     prev_logits = routing_state["logits"]
                     prev_logits = prev_logits.to(h_feat.dtype)
