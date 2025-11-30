@@ -121,7 +121,7 @@ def main():
     ev.add_argument("--ablate_global_router", action="store_true", help="Replace GRU router with standard router in ours_refine")
            
     an = sub.add_parser("analysis")
-    an.add_argument("--modes", type=str, default="switch,gshard,hash,ours_refine", help="Comma-separated mode list")
+    an.add_argument("--modes", type=str, default="dense,switch,gshard,hash,ours_refine", help="Comma-separated mode list")
     an.add_argument("--num_experts", type=int, default=16)
     an.add_argument("--batch_size", type=int, default=44)
     an.add_argument("--seq_len", type=int, default=1024)
@@ -227,7 +227,7 @@ if __name__ == "__main__":
     main()
 
 #python run.py train --mode ours_refine --num_experts 4 --batch_size 4 --seq_len 1024 --grad_accum 2
-#torchrun --nproc_per_node=8 --master_port=29600 run.py train --mode hash --num_experts 16 --batch_size 64 --seq_len 1024 --grad_accum 1
+#torchrun --nproc_per_node=8 --master_port=29600 run.py train --mode switch --num_experts 16 --batch_size 64 --seq_len 1024 --grad_accum 1 --ffn_dim 731
 #python run.py eval --batch_size 44 --num_experts 16
 
 # Full analysis (all modes, all metrics):
