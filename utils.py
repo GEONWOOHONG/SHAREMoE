@@ -5,6 +5,7 @@ from transformers import get_cosine_schedule_with_warmup
 import torch.optim as optim
 import torch.nn.functional as F
 import re
+from config import get_hash_table_path
 
 def _is_rank0() -> bool:
     return os.environ.get("RANK", "0") == "0"
@@ -379,6 +380,7 @@ def build_model_for_mode(mode: str, num_experts: int = 16, config=None):
         patch_model_basic,
         patch_model_for_hash_moe,
         patch_model_for_ours_refine,
+        patch_model_for_ours_com,
     )
     
     assert mode in {"dense", "switch", "gshard", "hash", "ours_refine", "ours_com"}, \
@@ -400,12 +402,29 @@ def build_model_for_mode(mode: str, num_experts: int = 16, config=None):
         patch_model_basic(model)
     else:
         eff_num_experts = num_experts if mode != "ours_refine" else (num_experts + 1)
-        model = convert_gpt2_to_moe(model, config, mode=mode, num_experts=eff_num_experts, alpha=0.01)
+        
+        freq_dict = None
+        if mode == "hash":
+            v_size = getattr(config, "vocab_size", 50257)
+            hash_path = get_hash_table_path(v_size)
+            freq_dict = {'__load_from_file__': hash_path}
+
+        model = convert_gpt2_to_moe(
+            model, 
+            config, 
+            mode=mode, 
+            num_experts=eff_num_experts, 
+            alpha=0.01, 
+            freq_dict=freq_dict
+        )
         
         if mode == "hash":
             patch_model_for_hash_moe(model)
         elif mode in ("ours_refine", "ours_com"):
-            patch_model_for_ours_refine(model)
+            if mode == "ours_com":
+                patch_model_for_ours_com(model)
+            else:
+                patch_model_for_ours_refine(model)
         else:
             patch_model_basic(model)
     
