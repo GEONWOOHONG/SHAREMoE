@@ -51,11 +51,11 @@ def load_pile_validation_with_source_labels() -> Tuple["datasets.Dataset", Dict[
     from data import load_pile_test
     ds = load_pile_test(verbose=True)
     print(f"Building source label mapping from meta.pile_set_name (using test set)")
-    all_sources = set([m["pile_set_name"] for m in ds["meta"]])
+    all_sources = set([m for m in ds["meta"]]) 
     source_to_idx = {name: i for i, name in enumerate(sorted(all_sources))}
     idx_to_source = {i: n for n, i in source_to_idx.items()}
     def add_id(example):
-        return {"pile_set_id": source_to_idx[example["meta"]["pile_set_name"]]}
+        return {"pile_set_id": source_to_idx[example["meta"]]}
     ds = ds.map(add_id, num_proc=max(1, os.cpu_count()//2))
     ds.set_format(type="torch", columns=["input_ids", "attention_mask", "pile_set_id"])
     print(f"Pile validation prepared: {len(ds)} samples, {len(source_to_idx)} unique sources")

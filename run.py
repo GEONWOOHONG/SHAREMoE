@@ -168,7 +168,6 @@ def main():
                         batch_size=args.batch_size,
                         seq_len=args.seq_len,
                         max_batches=max_batches,
-                        sample_fraction=sample_frac,
                         use_flash_attn=not args.no_flash,
                     )
                 except Exception as e:
