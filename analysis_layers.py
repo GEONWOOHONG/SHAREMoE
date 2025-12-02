@@ -38,6 +38,7 @@ class _Recorder:
     def __init__(self, max_tokens:int=16384):
         self.pre_mlp: Dict[int, List[torch.Tensor]]  = collections.defaultdict(list)
         self.post_mlp: Dict[int, List[torch.Tensor]] = collections.defaultdict(list)
+        self.expert_indices: Dict[int, List[torch.Tensor]] = collections.defaultdict(list)
         self.token_counts: Dict[int, int] = collections.defaultdict(int)
         self.layers: List[int] = []
         self.max_tokens = int(max_tokens)
@@ -46,15 +47,18 @@ class _Recorder:
         if not self.layers: return False
         return all(self.token_counts[l] >= self.max_tokens for l in self.layers)
 
-    def _trimcat(self, lst: List[torch.Tensor]) -> Optional[torch.Tensor]:
+    def _trimcat(self, lst: List[torch.Tensor], dtype=torch.float32) -> Optional[torch.Tensor]:
         if not lst: return None
         X = torch.cat(lst, dim=0)
         if X.size(0) > self.max_tokens:
             X = X[: self.max_tokens]
-        return X
+        return X.to(dtype)
 
     def get_pair(self, l:int) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         return self._trimcat(self.pre_mlp[l]), self._trimcat(self.post_mlp[l])
+    
+    def get_indices(self, l:int) -> Optional[torch.Tensor]:
+        return self._trimcat(self.expert_indices[l], dtype=torch.long)
 
 def _register_hooks(model: nn.Module, rec: _Recorder):
     handles = []
@@ -95,6 +99,22 @@ def _register_hooks(model: nn.Module, rec: _Recorder):
         if lidx is not None:
             rec.post_mlp[lidx].append(flat_cpu)
             rec.token_counts[lidx] += flat.size(0)
+
+            moe = getattr(module, "moe", None)
+            scores = None
+            if moe is not None:
+                if getattr(moe, "last_scores", None) is not None:
+                    scores = moe.last_scores
+                elif hasattr(moe, "router") and getattr(moe.router, "last_scores", None) is not None:
+                    scores = moe.router.last_scores
+                elif hasattr(moe, "xmoe_router") and getattr(moe.xmoe_router, "last_scores", None) is not None:
+                    scores = moe.xmoe_router.last_scores
+            
+            if scores is not None:
+                top1 = scores.detach().argmax(dim=-1).view(-1)
+                if top1.size(0) > needed:
+                    top1 = top1[:needed]
+                rec.expert_indices[lidx].append(top1.cpu())
 
     for name, module in model.named_modules():
         m = pat.match(name)
@@ -170,6 +190,42 @@ def compute_same_token_intra_expert_cka(model: nn.Module, rec: _Recorder, device
     return out
 
 @torch.no_grad()
+def compute_trajectory_metrics(rec: _Recorder) -> Dict:
+    print("Computing Trajectory Metrics (Expert Reuse)...")
+    layers = sorted(set(rec.layers))
+    out = {}
+    
+    reuse_rates = {}
+    
+    for i in range(len(layers) - 1):
+        l_curr = layers[i]
+        l_next = layers[i+1]
+        
+        idx_curr = rec.get_indices(l_curr)
+        idx_next = rec.get_indices(l_next)
+        
+        if idx_curr is None or idx_next is None:
+            continue
+            
+        min_len = min(idx_curr.size(0), idx_next.size(0))
+        if min_len == 0:
+            continue
+            
+        ic = idx_curr[:min_len]
+        in_ = idx_next[:min_len]
+        
+        matches = (ic == in_).float().mean().item()
+        reuse_rates[f"{l_curr}->{l_next}"] = matches
+        
+    out["layer_reuse_rate"] = reuse_rates
+    if reuse_rates:
+        out["avg_reuse_rate"] = float(np.mean(list(reuse_rates.values())))
+    else:
+        out["avg_reuse_rate"] = 0.0
+        
+    return out
+
+@torch.no_grad()
 def compute_A_metrics(rec: _Recorder) -> Dict:
     layers = sorted(set(rec.layers))
     out = {"LEI": {}, "InterCKA": {}, "InterCKA_by_delta": {}}
@@ -225,7 +281,7 @@ def run_analysis_A(mode: str = "ours_refine",
         ensure_flash_attn()
     if verbose:
         print(f"\n{'='*70}")
-        print(f"Layer-Level Analysis (Part A) - Mode: {mode}")
+        print(f"Layer-Level Analysis (Part A + Trajectory) - Mode: {mode}")
         print(f"{'='*70}")
     
     from data import load_pile_test, worker_init_fn, get_dataloader_generator
@@ -292,6 +348,9 @@ def run_analysis_A(mode: str = "ours_refine",
     
     intra_cka = compute_same_token_intra_expert_cka(model, rec, device)
     resA["IntraExpertCKA"] = intra_cka
+    
+    traj = compute_trajectory_metrics(rec)
+    resA["Trajectory"] = traj
     
     result = {
         "mode": mode,
