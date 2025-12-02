@@ -1,10 +1,11 @@
-# analysis_layers.py
+# analysis_layers.py (수정됨)
 import os, json, time, collections, re
 from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader
 
 from config import CHECKPOINTS_DIR
 from utils import (
@@ -16,9 +17,9 @@ from utils import (
 from modeling import MoELayer
 from transformers import GPT2Config
 
-# CKA 관련 함수들은 레이어 역할 분석을 위해 남겨두거나, 필요 없다면 주석 처리 가능합니다.
-# 요청하신 'Path'와 관련된 부분은 아래 Recorder와 save_raw_paths에 집중되어 있습니다.
-
+# -------------------------------------------------------------------------
+# 기존 함수들 (_cosine_similarity, _center, _cka_linear) 그대로 유지
+# -------------------------------------------------------------------------
 @torch.no_grad()
 def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     a = a.float(); b = b.float()
@@ -38,18 +39,27 @@ def _cka_linear(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
     den = torch.sqrt(((Xc.T @ Xc) ** 2).sum() + 1e-12) * torch.sqrt(((Yc.T @ Yc) ** 2).sum() + 1e-12)
     return num / (den + 1e-12)
 
+# -------------------------------------------------------------------------
+# [수정] Recorder: 소스 정보(src_ids)와 토큰 정보(token_ids)도 수집하도록 변경
+# -------------------------------------------------------------------------
 class _Recorder:
-    def __init__(self, max_tokens: int = 500000): # 분석을 위해 충분히 큰 값으로 설정
+    def __init__(self, max_tokens: int = 500000):
         self.pre_mlp: Dict[int, List[torch.Tensor]]  = collections.defaultdict(list)
         self.post_mlp: Dict[int, List[torch.Tensor]] = collections.defaultdict(list)
         self.expert_indices: Dict[int, List[torch.Tensor]] = collections.defaultdict(list)
+        
+        # [New] 메타데이터 수집용 리스트
+        self.batch_src_ids: List[torch.Tensor] = []    # 배치별 소스 ID
+        self.batch_token_ids: List[torch.Tensor] = []  # 배치별 토큰 ID
+        
         self.token_counts: Dict[int, int] = collections.defaultdict(int)
         self.layers: List[int] = []
         self.max_tokens = int(max_tokens)
+        self.captured_tokens = 0  # 0번 레이어 기준 수집된 총 토큰 수
 
     def is_full(self) -> bool:
         if not self.layers: return False
-        # 모든 레이어에서 max_tokens 이상 수집되었는지 확인
+        # 모든 레이어 데이터 + 메타데이터가 충분히 모였는지 확인
         return all(self.token_counts[l] >= self.max_tokens for l in self.layers)
 
     def _trimcat(self, lst: List[torch.Tensor], dtype=torch.float32) -> Optional[torch.Tensor]:
@@ -62,66 +72,63 @@ class _Recorder:
     def get_pair(self, l:int) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         return self._trimcat(self.pre_mlp[l]), self._trimcat(self.post_mlp[l])
     
-    def get_indices(self, l:int) -> Optional[torch.Tensor]:
-        return self._trimcat(self.expert_indices[l], dtype=torch.long)
+    # 메타데이터 기록 함수 추가
+    def record_metadata(self, input_ids: torch.Tensor, src_ids: torch.Tensor):
+        # input_ids: [B, T], src_ids: [B, T]
+        B, T = input_ids.shape
+        needed = self.max_tokens - self.captured_tokens
+        if needed <= 0: return
 
+        flat_ids = input_ids.reshape(-1)
+        flat_src = src_ids.reshape(-1)
+        
+        if flat_ids.size(0) > needed:
+            flat_ids = flat_ids[:needed]
+            flat_src = flat_src[:needed]
+            
+        self.batch_token_ids.append(flat_ids.cpu())
+        self.batch_src_ids.append(flat_src.cpu())
+        self.captured_tokens += flat_ids.size(0)
+
+# Hook 함수들은 기존 로직 유지 (메타데이터는 메인 루프에서 수집)
 def _register_hooks(model: nn.Module, rec: _Recorder):
     handles = []
     pat = re.compile(r"^transformer\.h\.(\d+)\.mlp$")
 
     def pre_hook(module, inputs):
         lidx = getattr(module, "_layer_idx", None)
-        if lidx is not None and rec.token_counts[lidx] >= rec.max_tokens:
-            return
-
+        if lidx is not None and rec.token_counts[lidx] >= rec.max_tokens: return
         x = inputs[0]
         if not isinstance(x, torch.Tensor): return
         B, T, H = x.shape
         needed = rec.max_tokens - rec.token_counts[lidx]
         flat = x.reshape(B*T, H)
-        if flat.size(0) > needed:
-            flat = flat[:needed]
-        
-        flat_cpu = flat.detach().to(torch.float32).cpu()
-        if lidx is not None:
-            rec.pre_mlp[lidx].append(flat_cpu)
+        if flat.size(0) > needed: flat = flat[:needed]
+        rec.pre_mlp[lidx].append(flat.detach().to(torch.float32).cpu())
 
     def fwd_hook(module, inputs, outputs):
         lidx = getattr(module, "_layer_idx", None)
-        if lidx is not None and rec.token_counts[lidx] >= rec.max_tokens:
-            return
-
+        if lidx is not None and rec.token_counts[lidx] >= rec.max_tokens: return
         out = outputs[0] if isinstance(outputs, (tuple, list)) else outputs
         B, T, H = out.shape
-        
         needed = rec.max_tokens - rec.token_counts[lidx]
         flat = out.reshape(B*T, H)
-        if flat.size(0) > needed:
-            flat = flat[:needed]
+        if flat.size(0) > needed: flat = flat[:needed]
         
-        flat_cpu = flat.detach().to(torch.float32).cpu()
-        
-        if lidx is not None:
-            rec.post_mlp[lidx].append(flat_cpu)
-            rec.token_counts[lidx] += flat.size(0)
+        rec.post_mlp[lidx].append(flat.detach().to(torch.float32).cpu())
+        rec.token_counts[lidx] += flat.size(0)
 
-            moe = getattr(module, "moe", None)
-            scores = None
-            if moe is not None:
-                # 라우터 점수 혹은 마지막 점수 가져오기
-                if getattr(moe, "last_scores", None) is not None:
-                    scores = moe.last_scores
-                elif hasattr(moe, "router") and getattr(moe.router, "last_scores", None) is not None:
-                    scores = moe.router.last_scores
-                elif hasattr(moe, "xmoe_router") and getattr(moe.xmoe_router, "last_scores", None) is not None:
-                    scores = moe.xmoe_router.last_scores
-            
-            if scores is not None:
-                # [Batch * Time, Num_Experts] -> Argmax -> Expert Index
-                top1 = scores.detach().argmax(dim=-1).view(-1)
-                if top1.size(0) > needed:
-                    top1 = top1[:needed]
-                rec.expert_indices[lidx].append(top1.cpu())
+        moe = getattr(module, "moe", None)
+        scores = None
+        if moe is not None:
+            if getattr(moe, "last_scores", None) is not None: scores = moe.last_scores
+            elif hasattr(moe, "router") and getattr(moe.router, "last_scores", None) is not None: scores = moe.router.last_scores
+            elif hasattr(moe, "xmoe_router") and getattr(moe.xmoe_router, "last_scores", None) is not None: scores = moe.xmoe_router.last_scores
+        
+        if scores is not None:
+            top1 = scores.detach().argmax(dim=-1).view(-1)
+            if top1.size(0) > needed: top1 = top1[:needed]
+            rec.expert_indices[lidx].append(top1.cpu())
 
     for name, module in model.named_modules():
         m = pat.match(name)
@@ -133,9 +140,64 @@ def _register_hooks(model: nn.Module, rec: _Recorder):
             handles.append(module.register_forward_hook(fwd_hook))
     return handles
 
+# -------------------------------------------------------------------------
+# [수정] save_raw_paths: 메타데이터(Source ID, Token ID)도 함께 저장
+# -------------------------------------------------------------------------
+@torch.no_grad()
+def save_raw_paths(rec: _Recorder, mode: str, idx_to_source: Dict[int, str]) -> str:
+    print("💾 Saving RAW Trajectory Paths with Metadata...")
+    layers = sorted(set(rec.layers))
+    if not layers: return ""
+    
+    # 1. Expert Indices 병합
+    layer_tensors = {}
+    sizes = []
+    for l in layers:
+        indices_list = rec.expert_indices[l]
+        if not indices_list: continue
+        t = torch.cat(indices_list, dim=0)
+        layer_tensors[l] = t
+        sizes.append(t.size(0))
+    
+    # 2. 메타데이터 병합
+    if not rec.batch_token_ids:
+        print("⚠️ No metadata collected.")
+        return ""
+    all_tokens = torch.cat(rec.batch_token_ids, dim=0)
+    all_srcs = torch.cat(rec.batch_src_ids, dim=0)
+    
+    # 3. 길이 동기화 (가장 짧은 길이에 맞춤)
+    min_len = min(sizes + [all_tokens.size(0), all_srcs.size(0)])
+    print(f"🔹 Aligning tokens across {len(layers)} layers & metadata. Count: {min_len:,}")
+
+    aligned_paths = []
+    for l in layers:
+        t = layer_tensors[l][:min_len].unsqueeze(1)
+        aligned_paths.append(t)
+    
+    raw_paths = torch.cat(aligned_paths, dim=1).to(torch.int16) # [N, Layers]
+    saved_tokens = all_tokens[:min_len].to(torch.int32)         # [N]
+    saved_srcs = all_srcs[:min_len].to(torch.int16)             # [N]
+    
+    # 4. 저장
+    filename = f"raw_trajectory_{mode}.pt"
+    save_path = os.path.join(CHECKPOINTS_DIR, filename)
+    
+    torch.save({
+        "paths": raw_paths,      # Tensor [N, L] (Expert IDs)
+        "tokens": saved_tokens,  # Tensor [N] (Token IDs - 단어 확인용)
+        "sources": saved_srcs,   # Tensor [N] (Source IDs - 출처 확인용)
+        "source_map": idx_to_source, # Dict[int, str] (ID -> 이름 매핑)
+        "layers": layers,
+        "mode": mode
+    }, save_path)
+    
+    print(f"✅ Saved raw paths & metadata to: {save_path}")
+    return save_path
+
+# compute_same_token_intra_expert_cka, compute_A_metrics 등 기존 분석 함수 유지
 @torch.no_grad()
 def compute_same_token_intra_expert_cka(model: nn.Module, rec: _Recorder, device: torch.device) -> Dict[int, float]:
-    # (기존 코드 유지: 레이어 역할 분석용)
     out = {}
     print("Computing Intra-Expert CKA (Same Token Similarity)...")
     layers = sorted(list(set(rec.layers)))
@@ -150,7 +212,6 @@ def compute_same_token_intra_expert_cka(model: nn.Module, rec: _Recorder, device
         block = model.transformer.h[l]
         if not hasattr(block, "mlp"): continue
         mlp = block.mlp
-        
         moe = getattr(mlp, "moe", None)
         if isinstance(mlp, MoELayer): moe = mlp
         if moe is None: continue
@@ -176,79 +237,19 @@ def compute_same_token_intra_expert_cka(model: nn.Module, rec: _Recorder, device
             for j in range(i + 1, num_experts):
                 val = _cka_linear(expert_outputs[i], expert_outputs[j]).item()
                 cka_vals.append(val)
-        
         if cka_vals: out[l] = float(np.mean(cka_vals))
         else: out[l] = 0.0
     return out
 
 @torch.no_grad()
-def save_raw_paths(rec: _Recorder, mode: str) -> str:
-    """
-    Trajectory Metric 계산을 대체합니다.
-    수집된 모든 토큰의 Expert Index를 [Total_Tokens, Num_Layers] 형태의 텐서로 저장합니다.
-    """
-    print("💾 Saving RAW Trajectory Paths (skipping metric calculation)...")
-    layers = sorted(set(rec.layers))
-    if not layers:
-        return ""
-    
-    # 1. 레이어별로 수집된 텐서 합치기 (Concat Batches)
-    layer_tensors = {}
-    sizes = []
-    
-    for l in layers:
-        indices_list = rec.expert_indices[l]
-        if not indices_list:
-            continue
-        # 모든 배치를 하나로 합침 [Total_Tokens]
-        t = torch.cat(indices_list, dim=0)
-        layer_tensors[l] = t
-        sizes.append(t.size(0))
-    
-    if not sizes:
-        print("⚠️ No trajectory data collected.")
-        return ""
-
-    # 2. 모든 레이어의 토큰 개수를 최소 길이로 맞춤 (Synchronization)
-    min_len = min(sizes)
-    print(f"🔹 Aligning tokens across {len(layers)} layers. Count: {min_len:,}")
-
-    aligned_paths = []
-    for l in layers:
-        # [min_len] -> [min_len, 1]
-        t = layer_tensors[l][:min_len].unsqueeze(1)
-        aligned_paths.append(t)
-    
-    # 3. [Total_Tokens, Num_Layers] 형태로 병합
-    # dtype을 int16으로 줄여서 용량 최적화 (Expert ID가 32000을 넘지 않는다고 가정)
-    raw_paths = torch.cat(aligned_paths, dim=1).to(torch.int16)
-    
-    # 4. 저장
-    filename = f"raw_trajectory_{mode}.pt"
-    save_path = os.path.join(CHECKPOINTS_DIR, filename)
-    
-    # 메타데이터와 함께 저장
-    torch.save({
-        "paths": raw_paths,  # Tensor [N, L]
-        "layers": layers,    # List[int]
-        "mode": mode
-    }, save_path)
-    
-    print(f"✅ Saved raw paths to: {save_path}")
-    print(f"   Shape: {raw_paths.shape}")
-    return save_path
-
-@torch.no_grad()
 def compute_A_metrics(rec: _Recorder) -> Dict:
-    # (기존 코드 유지: 레이어 변환 정도 LEI, CKA 계산)
     layers = sorted(set(rec.layers))
     out = {"LEI": {}, "InterCKA": {}, "InterCKA_by_delta": {}}
     
     print("Computing metrics based on collected activations (LEI, CKA)...")
     for l in layers:
         X, Y = rec.get_pair(l)
-        if X is None or Y is None or X.size(0) != Y.size(0):
-            continue
+        if X is None or Y is None or X.size(0) != Y.size(0): continue
         cos = _cosine_similarity(X, Y)
         out["LEI"][l] = float((1.0 - cos.mean()).item())
         
@@ -268,7 +269,6 @@ def compute_A_metrics(rec: _Recorder) -> Dict:
                 cka = _cka_linear(X[:n], Y[:n])
             key = f"{l1}-{l2}"
             inter_pairs[key] = float(cka.item())
-            
     out["InterCKA"] = inter_pairs
     delta_acc = collections.defaultdict(list)
     for k, v in inter_pairs.items():
@@ -289,21 +289,28 @@ def run_analysis_A(mode: str = "ours_refine",
                    verbose: bool = True):
     assert mode in {"dense","switch","gshard","hash","ours_refine"}, f"Unsupported mode: {mode}"
     set_seed(42)
-    if use_flash_attn:
-        ensure_flash_attn()
+    if use_flash_attn: ensure_flash_attn()
     
     if verbose:
         print(f"\n{'='*70}")
-        print(f"Layer-Level Analysis (Raw Path Collection) - Mode: {mode}")
+        print(f"Layer-Level Analysis (Trajectory + Metadata) - Mode: {mode}")
         print(f"{'='*70}")
     
     from data import load_pile_test, worker_init_fn, get_dataloader_generator
-    from torch.utils.data import DataLoader
     
+    # [수정] 메타데이터 로딩을 위해 pile_set_name 매핑 준비
     pile_test = load_pile_test(verbose=verbose)
-    pile_test.set_format(type="torch", columns=["input_ids", "attention_mask"])
+    all_sources = set([m for m in pile_test["meta"]])
+    source_to_idx = {name: i for i, name in enumerate(sorted(all_sources))}
+    idx_to_source = {i: n for n, i in source_to_idx.items()}
     
-    # 데이터 수집량 (기본값: 충분히 많이)
+    def add_id(example):
+        return {"pile_set_id": source_to_idx[example["meta"]]}
+    
+    pile_test = pile_test.map(add_id, num_proc=max(1, os.cpu_count()//2))
+    # [수정] pile_set_id 포함
+    pile_test.set_format(type="torch", columns=["input_ids", "attention_mask", "pile_set_id"])
+    
     rec_max = 500_000 if max_batches is None else (max_batches * batch_size * seq_len)
     rec = _Recorder(max_tokens=rec_max)
     
@@ -343,6 +350,14 @@ def run_analysis_A(mode: str = "ours_refine",
             
         input_ids = batch["input_ids"][:, :seq_len].to(device, non_blocking=True)
         attn      = batch["attention_mask"][:, :seq_len].to(device, non_blocking=True)
+        # [수정] 소스 ID 준비
+        src_ids_scalar = batch["pile_set_id"].view(-1, 1) # [B, 1]
+        # [B, T]로 확장
+        current_seq = input_ids.shape[1]
+        src_ids = src_ids_scalar.expand(-1, current_seq).to(device, non_blocking=True)
+
+        # [수정] 메타데이터 기록 (Forward 전/후 상관없이 배치 단위 기록)
+        rec.record_metadata(input_ids, src_ids)
         
         with torch.inference_mode():
             if device.type == "cuda":
@@ -354,13 +369,11 @@ def run_analysis_A(mode: str = "ours_refine",
         if verbose and processed % 10 == 0:
             print(f"Processed {processed} batches...")
             
-    # 1. Raw Path 저장 (핵심 변경)
-    raw_path_file = save_raw_paths(rec, mode)
+    # [수정] 메타데이터 맵도 함께 전달
+    raw_path_file = save_raw_paths(rec, mode, idx_to_source)
     
-    # 2. CKA, LEI 등은 여전히 유효하므로 계산해서 JSON 저장 (경로 통계는 제외됨)
     resA = compute_A_metrics(rec)
     resA["IntraExpertCKA"] = compute_same_token_intra_expert_cka(model, rec, device)
-    # resA["Trajectory"] 키는 이제 포함되지 않음 (Raw 파일로 대체)
     
     result = {
         "mode": mode,
