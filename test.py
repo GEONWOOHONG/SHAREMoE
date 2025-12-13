@@ -26,7 +26,7 @@ from patches import (
 from train import evaluate as eval_ppl_only, compute_moe_stats
 from utils import ensure_flash_attn, set_seed, load_safetensors
 
-from config import CHECKPOINTS_DIR, get_hash_table_path
+from config import CHECKPOINTS_DIR, get_hash_table_path, MODEL_SPECS
 from tools_hash import create_global_hash_table
 
 def load_or_prepare_wt103():
@@ -136,7 +136,9 @@ def measure_decode_throughput(model, prompt_ids, gen_len=50, dtype=torch.bfloat1
         "Decode_gen": int(gen_len)
     }
 
-def run_all_tests(batch_size=44, base_num_experts=16,
+def run_all_tests(batch_size=44,
+                  model_size="base",
+                  base_num_experts=16,
                   ablate_local: bool = False,
                   ablate_global: bool = False,
                   ablate_logit_prog: bool = False,
@@ -236,9 +238,16 @@ def run_all_tests(batch_size=44, base_num_experts=16,
             if os.path.exists(cfg_path):
                 config = GPT2Config.from_pretrained(cfg_dir)
             else:
+                print(f"⚠️ Config missing. Fallback to --{model_size}")
+                spec = MODEL_SPECS.get(model_size, MODEL_SPECS["base"])
                 config = GPT2Config(
-                    vocab_size=50257, n_positions=1024, n_ctx=1024,
-                    n_embd=1024, n_layer=8, n_head=8
+                    vocab_size=50257,
+                    n_positions=1024,
+                    n_ctx=1024,
+                    n_embd=spec["n_embd"],
+                    n_layer=spec["n_layer"],
+                    n_head=spec["n_head"],
+                    n_inner=spec["d_ff"]
                 )
                 
             cfg_ablate_local = bool(getattr(config, "ablate_local", False))

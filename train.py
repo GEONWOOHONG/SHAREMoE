@@ -30,6 +30,8 @@ from modeling import convert_gpt2_to_moe, GPT2LayerMoE
 
 from torch.utils.tensorboard import SummaryWriter
 
+from config import MODEL_SPECS
+
 enc = tiktoken.get_encoding("gpt2")
 
 def init_distributed():
@@ -124,7 +126,9 @@ def compute_moe_stats(model, config, mode):
     return {"balance": sum(balance_scores) / len(balance_scores) if balance_scores else 0.0}
 
 def train_moe(
-    mode="switch", num_experts=8,
+    mode="switch",
+    model_size="base",
+    num_experts=8,
     batch_size=32, seq_len=1024, grad_accum=1,
     continue_training=False, mt=False,
     ablate_local: bool = False,
@@ -257,14 +261,17 @@ def train_moe(
         trainer_state = torch.load(trainer_path, map_location="cpu")
         print(f"🔹 Restoring optimizer/scheduler from {trainer_path}")
     else:
+        spec = MODEL_SPECS.get(model_size, MODEL_SPECS["base"])
+        print(f"🏗️ Initializing {model_size.upper()} model: {spec}")
+        
         config = GPT2Config(
             vocab_size=vocab_size,
             n_positions=1024,
             n_ctx=1024,
-            n_embd=768,
-            n_layer=12,
-            n_head=12,
-            n_inner=3072
+            n_embd=spec["n_embd"],
+            n_layer=spec["n_layer"],
+            n_head=spec["n_head"],
+            n_inner=spec["d_ff"]
         )
         model = GPT2LMHeadModel(config)
         stable_args = dict(stable_routing_dim=50, stable_balance_alpha=0.3)

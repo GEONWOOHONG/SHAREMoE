@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 from transformers import GPT2Config, GPT2LMHeadModel
 from safetensors.torch import safe_open
 
-from config import CHECKPOINTS_DIR, HF_DATASETS_CACHE, HF_HOME, HASH_TABLE_PATH, WORKSPACE_ROOT
+from config import CHECKPOINTS_DIR, HF_DATASETS_CACHE, HF_HOME, HASH_TABLE_PATH, WORKSPACE_ROOT, MODEL_SPECS
 from modeling import MoELayer
 from data import load_or_prepare_pile, worker_init_fn, get_dataloader_generator
 from utils import (
@@ -212,6 +212,7 @@ def extract_model_metadata(model: nn.Module, mode: str, num_experts: int) -> Dic
 
 def run_specialization_only(
     modes: List[str] = ("switch","gshard","hash","ours_refine"),
+    model_size: str = "base",
     num_experts: int = 16,
     batch_size: int = 44,
     seq_len: int = 1024,
@@ -260,8 +261,17 @@ def run_specialization_only(
              config = GPT2Config.from_pretrained(os.path.dirname(ckpt_path))
              if verbose: print(f"🔹 Loaded config from {os.path.dirname(ckpt_path)}")
         else:
-             print("⚠️ Config not found, using default parameters")
-             config = GPT2Config(vocab_size=50257, n_positions=1024, n_ctx=1024, n_embd=768, n_layer=12, n_head=12)
+             print(f"⚠️ Config not found. Falling back to --{model_size}")
+             spec = MODEL_SPECS.get(model_size, MODEL_SPECS["base"])
+             config = GPT2Config(
+                 vocab_size=50257, 
+                 n_positions=1024, 
+                 n_ctx=1024, 
+                 n_embd=spec["n_embd"], 
+                 n_layer=spec["n_layer"], 
+                 n_head=spec["n_head"],
+                 n_inner=spec["d_ff"]
+             )
 
         model = build_model_for_mode(mode, num_experts=num_experts, config=config)
         load_checkpoint_if_exists(model, mode, CHECKPOINTS_DIR, strict=False)
@@ -336,6 +346,9 @@ if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--modes", type=str, default="switch,gshard,hash,ours_refine")
+    ap.add_argument("--small", action="store_true")
+    ap.add_argument("--base", action="store_true")
+    ap.add_argument("--large", action="store_true")
     ap.add_argument("--num_experts", type=int, default=16)
     ap.add_argument("--batch_size", type=int, default=44)
     ap.add_argument("--seq_len", type=int, default=1024)
@@ -343,9 +356,15 @@ if __name__ == "__main__":
     ap.add_argument("--no_flash", action="store_true")
     ap.add_argument("--sample_fraction", type=float, default=0.10)
     args = ap.parse_args()
+    
+    ms = "base"
+    if args.small: ms = "small"
+    elif args.large: ms = "large"
+    
     modes = [m.strip() for m in args.modes.split(",") if m.strip()]
     run_specialization_only(
         modes=modes,
+        model_size=ms,
         num_experts=args.num_experts,
         batch_size=args.batch_size,
         seq_len=args.seq_len,

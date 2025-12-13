@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from config import CHECKPOINTS_DIR
+from config import CHECKPOINTS_DIR, MODEL_SPECS
 from utils import (
     set_seed,
     ensure_flash_attn,
@@ -332,6 +332,7 @@ def compute_A_metrics(rec: _Recorder) -> Dict:
 
 @torch.no_grad()
 def run_analysis_A(mode: str = "ours_refine",
+                   model_size: str = "base",
                    num_experts: int = 16,
                    batch_size: int = 64,
                    seq_len: int = 1024,
@@ -382,7 +383,16 @@ def run_analysis_A(mode: str = "ours_refine",
     if ckpt_path and os.path.exists(os.path.join(os.path.dirname(ckpt_path), "config.json")):
         config = GPT2Config.from_pretrained(os.path.dirname(ckpt_path))
     else:
-        config = GPT2Config(vocab_size=50257, n_positions=1024, n_ctx=1024, n_embd=768, n_layer=12, n_head=12)
+        spec = MODEL_SPECS.get(model_size, MODEL_SPECS["base"])
+        config = GPT2Config(
+            vocab_size=50257,
+            n_positions=1024,
+            n_ctx=1024,
+            n_embd=spec["n_embd"],
+            n_layer=spec["n_layer"],
+            n_head=spec["n_head"],
+            n_inner=spec["d_ff"]
+        )
 
     model = build_model_for_mode(mode, num_experts=num_experts, config=config)
     load_checkpoint_if_exists(model, mode, CHECKPOINTS_DIR, strict=False)

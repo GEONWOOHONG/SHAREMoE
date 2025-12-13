@@ -7,7 +7,6 @@ os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-# workspace 경로 설정 (config.py에서 가져옴)
 from config import HF_HOME, HF_DATASETS_CACHE
 os.environ.setdefault("HF_HOME", HF_HOME)
 os.environ.setdefault("HF_DATASETS_CACHE", HF_DATASETS_CACHE)
@@ -17,6 +16,7 @@ import argparse
 from train import train_moe
 from utils import set_seed
 from analysis_layers import run_analysis_A
+from analysis_specialization_confidence import run_specialization_only as run_specialization_confidence
 
 def _setenv_if_missing(k, v):
     if os.environ.get(k) in (None, ""):
@@ -95,7 +95,14 @@ def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
 
+    def add_size_args(parser):
+        group = parser.add_mutually_exclusive_group()
+        group.add_argument("--small", action="store_true", help="Use Small model config")
+        group.add_argument("--base", action="store_true", help="Use Base model config (Default)")
+        group.add_argument("--large", action="store_true", help="Use Large model config")
+
     tr = sub.add_parser("train")
+    add_size_args(tr)
     tr.add_argument("--mode", default="switch")
     tr.add_argument("--num_experts", type=int, default=16)
     tr.add_argument("--batch_size", type=int, default=44)
@@ -110,6 +117,7 @@ def main():
     tr.add_argument("--ffn_dim", type=int, default=None, help="Custom FFN dimension size")
     
     ev = sub.add_parser("eval")
+    add_size_args(ev)
     ev.add_argument("--mode", default="switch")
     ev.add_argument("--num_experts", type=int, default=16)
     ev.add_argument("--batch_size", type=int, default=44)
@@ -121,6 +129,7 @@ def main():
     ev.add_argument("--ffn_dim", type=int, default=None, help="Custom FFN dimension size")
      
     an = sub.add_parser("analysis")
+    add_size_args(an)
     an.add_argument("--modes", type=str, default="dense,switch,gshard,hash,ours_refine", help="Comma-separated mode list")
     an.add_argument("--num_experts", type=int, default=16)
     an.add_argument("--batch_size", type=int, default=44)
@@ -136,15 +145,20 @@ def main():
 
     args = ap.parse_args()
 
+    model_size = "base"
+    if hasattr(args, "small") and args.small:
+        model_size = "small"
+    elif hasattr(args, "large") and args.large:
+        model_size = "large"
+
     if args.cmd == "analysis":
         set_seed(42)
         modes_list = [m.strip() for m in args.modes.split(",") if m.strip()]
         
-        # Adjust sample_fraction for debug mode
         sample_frac = 0.001 if args.debug else args.sample_fraction
         max_batches = args.max_batches
         if args.debug and max_batches is None:
-            max_batches = 2  # minimal batches for debug
+            max_batches = 2
         
         print("\n" + "="*80)
         print("🔍 ANALYSIS ORCHESTRATOR")
@@ -156,7 +170,6 @@ def main():
         print(f"Debug Mode: {args.debug}")
         print("="*80 + "\n")
         
-        # 1) Layer-level analysis (LEI, CKA, Intra-redundancy)
         if not args.skip_layers:
             print("\n[1/2] Running layer-level analysis (LEI, CKA, etc.)...")
             for mode in modes_list:
@@ -164,6 +177,7 @@ def main():
                 try:
                     run_analysis_A(
                         mode=mode,
+                        model_size=model_size,
                         num_experts=args.num_experts,
                         batch_size=args.batch_size,
                         seq_len=args.seq_len,
@@ -175,12 +189,12 @@ def main():
         else:
             print("\n[1/2] Skipping layer-level analysis (--skip_layers)")
         
-        # 2) Specialization & Confidence analysis
         if not args.skip_specialization:
             print("\n[2/2] Running specialization & confidence analysis...")
             try:
                 run_specialization_confidence(
                     modes=modes_list,
+                    model_size=model_size,
                     num_experts=args.num_experts,
                     batch_size=args.batch_size,
                     seq_len=args.seq_len,
@@ -200,6 +214,7 @@ def main():
         set_seed(42)
         train_moe(
             mode=args.mode,
+            model_size=model_size,
             num_experts=args.num_experts,
             batch_size=args.batch_size,
             seq_len=args.seq_len,
@@ -216,6 +231,7 @@ def main():
         from test import run_all_tests
         run_all_tests(
             batch_size=args.batch_size,
+            model_size=model_size,
             base_num_experts=args.num_experts,
             ablate_local=args.ablate_local,
             ablate_global=args.ablate_global,
